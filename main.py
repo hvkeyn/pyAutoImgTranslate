@@ -1,33 +1,88 @@
+import sys
+import os
+import time
+import threading
+import struct
+import io
+
 import tkinter as tk
 from tkinter import scrolledtext
-from PIL import Image, ImageGrab, ImageTk, ImageDraw
-import io
-import requests
+
 import keyboard
 import mouse
-import time
+import requests
 import pytesseract
 import win32clipboard
 import win32con
-import struct
-import threading
 import pystray
-import sys
-import os
+import numpy as np
+import cv2
+
+from PIL import Image, ImageGrab, ImageTk, ImageDraw
 
 # Если tesseract установлен не в PATH, укажите путь явно:
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# Цветовая палитра
-PRIMARY_COLOR = "#F54B64"   # Основной акцент
-PRIMARY_COLOR_2 = "#F78361" # Вторая часть градиента (при желании можно использовать в других местах)
-SECONDARY_COLOR = "#FFD42B" # Второстепенный акцент
-DARK_GREY = "#4E586E"       # Тёмно-серый для фона
-WHITE = "#FFFFFF"           # Белый
-
 # Глобальная переменная для окна результата
 result_window = None
 
+# Цветовая палитра (пример, можно изменить при необходимости)
+PRIMARY_COLOR = "#F54B64"
+PRIMARY_COLOR_2 = "#F78361"
+SECONDARY_COLOR = "#FFD42B"
+DARK_GREY = "#4E586E"
+WHITE = "#FFFFFF"
+
+
+# --------------------- Улучшенная функция deskew_image ---------------------
+def deskew_image(pil_image):
+    """
+    Принимает PIL-изображение, инвертирует его, определяет угол поворота
+    и выравнивает (deskew) изображение с использованием OpenCV.
+    Возвращает скорректированное PIL-изображение без обрезки текста.
+    """
+    # Конвертируем PIL -> OpenCV (BGR)
+    cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    # Переводим в оттенки серого и инвертируем, чтобы текст стал ярким на темном фоне
+    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+
+    # Бинаризация с использованием порога Оцу
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    # Находим координаты всех белых пикселей
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) == 0:
+        return pil_image
+
+    # Определяем минимальный прямоугольник, окружающий текст
+    angle = cv2.minAreaRect(coords)[-1]
+
+    # Корректируем угол (minAreaRect возвращает угол в диапазоне [-90, 0))
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    # Вычисляем новые размеры, чтобы избежать обрезки после поворота
+    (h, w) = cv_image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    nW = int((h * sin) + (w * cos))
+    nH = int((h * cos) + (w * sin))
+    # Корректируем матрицу поворота с учетом сдвига
+    M[0, 2] += (nW / 2) - center[0]
+    M[1, 2] += (nH / 2) - center[1]
+
+    rotated = cv2.warpAffine(cv_image, M, (nW, nH), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    rotated_pil = Image.fromarray(cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB))
+    return rotated_pil
+
+
+# --------------------- Функции для работы с буфером обмена ---------------------
 def get_image_from_clipboard():
     """
     Пытается получить изображение из буфера обмена.
@@ -69,6 +124,7 @@ def get_image_from_clipboard():
         print("Ошибка создания изображения из CF_DIB:", e)
         return None
 
+
 def wait_for_clipboard_image(timeout=5):
     """
     Ожидает появления изображения в буфере обмена в течение timeout секунд.
@@ -81,32 +137,42 @@ def wait_for_clipboard_image(timeout=5):
         time.sleep(0.2)
     return None
 
+
+# --------------------- OCR и перевод ---------------------
 def ocr_image(image):
     """
-    Извлекает текст из изображения с помощью pytesseract.
+    Выпрямляет изображение (deskew) и извлекает текст с помощью pytesseract.
     """
-    text = pytesseract.image_to_string(image, lang="eng")
+    deskewed = deskew_image(image)
+    #deskewed.save("debug_deskewed.png")
+    config = r"--psm 6 --oem 3"
+    upscaled = upscale_image(deskewed, scale=2)
+    text = pytesseract.image_to_string(upscaled, lang="eng", config=config)
     return text
+
+def upscale_image(pil_image, scale=2):
+    cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    # Увеличиваем в 2 раза
+    upscaled = cv2.resize(cv_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return Image.fromarray(cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB))
 
 def send_text_for_translation(text):
     """
     Отправляет текст на локальный сервер LM Studio по эндпоинту /v1/chat/completions.
-    Используются два сообщения:
-      - Системное сообщение: инструкция, чтобы модель переводила текст на русский
-        и возвращала только один краткий результат перевода без дополнительных строк, комментариев, повторов или форматирования.
-      - Пользовательское сообщение: исходный текст для перевода.
+    Использует системное и пользовательское сообщения для запроса чистого перевода.
     """
     url = "http://127.0.0.1:1234/v1/chat/completions"
     payload = {
         "model": "llama-translate",  # замените на имя вашей модели
         "messages": [
-            {"role": "system",
-             "content": (
+            {
+                "role": "system",
+                "content": (
                     "Переведи данный текст на русский язык. Верни только один краткий результат перевода, "
                     "без каких-либо дополнительных строк, комментариев, повторов или форматирования. "
                     "Ответ должен состоять только из перевода."
                 )
-             },
+            },
             {"role": "user", "content": text}
         ],
         "temperature": 0.0,
@@ -122,17 +188,15 @@ def send_text_for_translation(text):
         return {}
 
 
+# --------------------- Окно результата ---------------------
 def show_result(image, translation):
     """
-    Окно с «плоским» оформлением и новой цветовой гаммой:
-      - Фон окна и фреймов: DARK_GREY
-      - Область перевода: белый фон (WHITE) с тёмно-серым текстом (DARK_GREY)
-      - Прокрутка и рамки в «плоском» стиле
-      - Возможность копировать любую часть текста через правый клик
+    Отображает окно с изображением и переводом.
+    Интерфейс оформлен в плоском стиле с заданной цветовой гаммой.
+    Обеспечивается масштабирование элементов, область с переводом имеет прокрутку,
+    а пользователь может копировать выделенные фрагменты через контекстное меню.
     """
     global result_window
-
-    # Закрываем предыдущее окно, если открыто
     if result_window is not None:
         try:
             result_window.destroy()
@@ -140,45 +204,38 @@ def show_result(image, translation):
             pass
 
     result_window = tk.Tk()
-    result_window.title("Скриншот и перевод")
-
-    # Ставим окно поверх
+    result_window.title("Скриншот и перевод ИИ")
     result_window.attributes("-topmost", True)
     result_window.focus_force()
-
-    # Закрытие по Esc
     result_window.bind("<Escape>", lambda e: result_window.destroy())
 
-    # Фон окна — тёмно-серый
+    # Применяем цветовую гамму
     result_window.configure(bg=DARK_GREY)
 
-    # Настраиваем сетку для масштабирования
+    # Настройка grid для масштабирования
     result_window.rowconfigure(0, weight=1)
     result_window.columnconfigure(0, weight=1)
 
-    # Создаём фрейм (фон — DARK_GREY, без объёмных рамок)
     frame = tk.Frame(result_window, bg=DARK_GREY, bd=0, highlightthickness=0)
     frame.grid(sticky="nsew", padx=10, pady=10)
     frame.rowconfigure(0, weight=1)
-    frame.columnconfigure(1, weight=1)  # Колонка для текста будет растягиваться
+    frame.columnconfigure(1, weight=1)
 
     # Изображение слева
     img_tk = ImageTk.PhotoImage(image)
     label_img = tk.Label(frame, image=img_tk, bg=DARK_GREY, bd=0, highlightthickness=0, relief="flat")
     label_img.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
-    label_img.image = img_tk  # чтобы не удалилось сборщиком мусора
+    label_img.image = img_tk
 
-    # Фрейм для текстовой области с прокруткой
+    # Текстовая область справа
     text_frame = tk.Frame(frame, bg=DARK_GREY, bd=0, highlightthickness=0)
     text_frame.grid(row=0, column=1, padx=5, pady=5, sticky="nsew")
     text_frame.rowconfigure(0, weight=1)
     text_frame.columnconfigure(0, weight=1)
 
-    # Горизонтальная/вертикальная прокрутка (если нужно, можно добавить и xscrollbar)
     scrollbar = tk.Scrollbar(text_frame, orient=tk.VERTICAL)
     scrollbar.grid(row=0, column=1, sticky="ns")
 
-    # Текстовый виджет — белый фон, тёмно-серый текст, «плоский» стиль
     text_widget = tk.Text(
         text_frame,
         wrap="word",
@@ -192,20 +249,17 @@ def show_result(image, translation):
     text_widget.grid(row=0, column=0, sticky="nsew")
     scrollbar.config(command=text_widget.yview)
 
-    # Вставляем перевод и делаем виджет только для чтения
     text_widget.insert(tk.END, translation)
     text_widget.config(state="disabled")
 
-    # Настраиваем цвет выделения текста (PRIMARY_COLOR)
-    # Чтобы сработало, нужно временно разблокировать текст
+    # Настройка цвета выделения текста
     text_widget.config(state="normal")
     text_widget.tag_configure("sel", background=PRIMARY_COLOR, foreground=WHITE)
     text_widget.config(state="disabled")
 
-    # Функция копирования выделенного текста
+    # Контекстное меню для копирования выделенного фрагмента
     def copy_selected():
         try:
-            # Временно включаем виджет, чтобы получить выделенный фрагмент
             text_widget.config(state="normal")
             selected = text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
             text_widget.config(state="disabled")
@@ -215,11 +269,9 @@ def show_result(image, translation):
         except tk.TclError:
             pass
 
-    # Контекстное меню (правый клик) для копирования выделенного текста
-    context_menu = tk.Menu(text_widget, tearoff=0, bg=WHITE, fg=DARK_GREY, bd=0)
+    context_menu = tk.Menu(text_widget, tearoff=0, bg=WHITE, fg=DARK_GREY)
     context_menu.add_command(label="Копировать", command=copy_selected)
 
-    # Отображаем меню по правому клику
     def show_context_menu(event):
         context_menu.tk_popup(event.x_root, event.y_root)
 
@@ -228,10 +280,15 @@ def show_result(image, translation):
     result_window.mainloop()
     result_window = None
 
+
+# --------------------- Горячая клавиша и логика ---------------------
+process_pending = False
+
+
 def wait_for_left_click(timeout=10):
     """
     Ждёт последовательность: нажатие (down) левой кнопки мыши, затем её отпускание (up).
-    Если до завершения последовательности нажата любая клавиша – ожидание отменяется.
+    Если до завершения последовательности нажата любая другая клавиша – ожидание отменяется.
     Возвращает True, если последовательность выполнена, иначе False.
     """
     left_pressed = False
@@ -265,14 +322,13 @@ def wait_for_left_click(timeout=10):
     keyboard.unhook(on_key_event)
     return left_pressed and left_released and not cancelled
 
-process_pending = False
 
 def on_hotkey():
     """
     Обработчик нажатия Win+Shift+S.
     После отпускания горячих клавиш предлагается выбрать область стандартным способом:
     нажать и отпустить левую кнопку мыши, затем ждётся, пока изображение появится в буфере обмена.
-    После этого выполняется OCR, отправка на LM Studio и вывод результата.
+    После этого выполняется OCR (с deskew), отправка на LM Studio и вывод результата.
     Если последовательность не завершена, никакого результата не показывается.
     """
     global process_pending
@@ -304,9 +360,11 @@ def on_hotkey():
         print("Ожидание отменено – нажата другая клавиша.")
     process_pending = False
 
+
+# --------------------- Системный трей (иконка и выход) ---------------------
 def create_image_for_tray():
     """
-    Пытается загрузить значок из файла translator.ico.
+    Пытается загрузить значок из файла translator.png.
     Если не удаётся, создается дефолтное изображение.
     """
     try:
@@ -319,20 +377,25 @@ def create_image_for_tray():
         draw.rectangle((16, 16, 48, 48), fill=(200, 200, 0))
         return image
 
+
 def on_exit(icon, item):
     icon.stop()
     keyboard.unhook_all()
     os._exit(0)
 
+
 def start_tray_icon():
-    menu = pystray.Menu(pystray.MenuItem('Выход', on_exit))
-    icon = pystray.Icon("pyAutoImgTranslate", create_image_for_tray(), "Переводчик ИИ", menu)
+    from pystray import Icon, Menu, MenuItem
+    menu = Menu(MenuItem('Выход', on_exit))
+    icon = Icon("pyAutoImgTranslate", create_image_for_tray(), "Скриншот и перевод ИИ", menu)
     icon.run()
+
 
 if __name__ == "__main__":
     tray_thread = threading.Thread(target=start_tray_icon)
     tray_thread.daemon = True
     tray_thread.start()
+
     print("Ожидается нажатие Win+Shift+S для создания скриншота стандартным способом Windows...")
     keyboard.add_hotkey('windows+shift+s', on_hotkey)
     keyboard.wait()
