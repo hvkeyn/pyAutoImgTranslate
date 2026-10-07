@@ -65,10 +65,23 @@ sudo apt-get install -y python3 python3-pip python3-venv python3-tk \
 ```bash
 # Linux
 ./build.sh            # -> dist/pyAutoImgTranslate
+./build_deb.sh 1.6.0  # -> dist/pyautoimgtranslate_1.6.0_<arch>.deb
 
 # Windows
 build.bat             # -> dist\pyAutoImgTranslate.exe
 ```
+
+### Install the .deb (Debian/Ubuntu)
+
+```bash
+sudo apt install ./pyautoimgtranslate_1.6.0_amd64.deb
+# then run:  pyautoimgtranslate   (or launch from the applications menu)
+```
+
+The `.deb` installs the binary to `/usr/lib/pyautoimgtranslate/`, a launcher to
+`/usr/bin/pyautoimgtranslate`, plus a desktop entry and icon. Dependencies
+(`python3-tk`, `libgl1`, `libglib2.0-0`) are pulled in automatically; Tesseract,
+`xclip` and a screenshot tool are recommended.
 
 ## Configuration
 

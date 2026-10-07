@@ -7,13 +7,18 @@
 
 ### Добавлено
 
-- **Поддержка Linux (Debian/Ubuntu).** Автоопределение ОС: горячие клавиши `Ctrl+Alt+S` /
+- **.deb-пакет для Debian/Ubuntu.** `build_deb.sh` собирает устанавливаемый пакет
+  `pyautoimgtranslate_<version>_<arch>.deb`: бинарник в `/usr/lib`, лончер в
+  `/usr/bin/pyautoimgtranslate`, пункт меню и иконка, зависимости в `Depends`,
+  хуки `postinst`/`prerm`. Устанавливается через `apt install ./….deb`.
+- **Поддержка Linux (Debian/Ubuntu).** Автодетект ОС: горячие клавиши `Ctrl+Alt+S` /
   `Ctrl+Alt+A`, буфер обмена через `xclip`/`xsel`/`wl-paste`, захват области через
   `grim`/`gnome-screenshot`/`spectacle`/`scrot`/`maim`/`flameshot`, автозапуск
   через `~/.config/autostart/*.desktop`, глобальные хоткеи через `pynput`,
   единый экземпляр через файловую блокировку.
 - **Скрипты сборки:** `build.sh` (Linux) и `build.bat` (Windows).
-- **Релизы:** `pyAutoImgTranslate.exe` (Windows) и `pyAutoImgTranslate` (Linux).
+- **Релизы:** `pyAutoImgTranslate.exe` (Windows), `pyAutoImgTranslate` (Linux) и
+  `pyautoimgtranslate_<version>_amd64.deb` (Debian/Ubuntu).
 
 ### Исправлено (найдено при тестировании под Debian)
 
