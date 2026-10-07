@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Локальные настройки и логи (могут содержать API-ключи)
+config.json
+*.log
+*.log.*
+
+# Сборка PyInstaller
+build/
+dist/
+*.spec.bak
