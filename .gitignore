@@ -11,4 +11,5 @@ config.json
 # Сборка PyInstaller
 build/
 dist/
+dist-linux/
 *.spec.bak

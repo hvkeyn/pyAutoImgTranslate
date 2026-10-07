@@ -1,12 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 
+is_windows = sys.platform.startswith("win")
+
+# Скрытые импорты зависят от ОС: бэкенд трея и библиотека хоткеев.
+if is_windows:
+    hidden = ["pystray._win32", "keyboard", "win32clipboard", "win32con", "win32api"]
+else:
+    hidden = ["pystray._xorg", "pystray._appindicator", "pynput"]
+
+# Иконка: на Windows — .ico/.png, на Linux иконка встраивается в data.
+icon_arg = ["translator.png"] if is_windows else None
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=[('translator.png', '.')],
-    hiddenimports=['pystray._win32'],
+    hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +33,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='main',
+    name='pyAutoImgTranslate',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,5 +46,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['translator.png'],
+    icon=icon_arg,
 )

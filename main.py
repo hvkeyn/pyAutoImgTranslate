@@ -2,10 +2,13 @@
 pyAutoImgTranslate — перевод текста с экрана.
 
 Возможности:
-  * Win+Shift+S — выделение области экрана, OCR (Tesseract), перевод ИИ.
+  * Захват области экрана — на Windows Win+Shift+S (штатный оверлей), на Linux
+    Ctrl+Alt+S (вызывает установленный инструмент: grim/gnome-screenshot/spectacle/
+    scrot/maim/flameshot). Далее OCR (Tesseract) или vision-нейросеть и перевод.
   * Поддержка нескольких провайдеров перевода: локальный LM Studio (OpenAI-совместимый
     сервер) и DeepSeek (облачный API). Можно добавлять свои модели.
-  * Автозапуск вместе с Windows, работа в системном трее, логирование в файл.
+  * Автозапуск при входе в систему (Windows — реестр, Linux — ~/.config/autostart),
+    работа в системном трее, логирование в файл.
   * Ненавязчивое окно результата с картинкой и аккуратным блоком перевода.
 """
 
@@ -18,9 +21,12 @@ import json
 import logging
 import logging.handlers
 import os
+import platform
 import queue
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -30,14 +36,25 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 import cv2
-import keyboard
 import numpy as np
 import pytesseract
 import requests
-import win32clipboard
-import win32con
 
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
+
+IS_WINDOWS = sys.platform.startswith("win")
+IS_LINUX = sys.platform.startswith("linux")
+
+# Windows-only библиотеки подключаем только на Windows.
+if IS_WINDOWS:
+    import win32clipboard  # type: ignore
+    import win32con  # type: ignore
+
+# Глобальные горячие клавиши: на Windows — keyboard; на Linux — pynput (если доступен).
+if IS_WINDOWS:
+    import keyboard  # type: ignore
+else:
+    keyboard = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Пути и окружение (работает и из исходников, и из собранного .exe)
@@ -95,23 +112,41 @@ def setup_logging() -> None:
 # ---------------------------------------------------------------------------
 # DeepSeek API-ключ по умолчанию. Его можно переопределить в config.json
 # или через переменную окружения DEEPSEEK_API_KEY.
-DEFAULT_DEEPSEEK_API_KEY = "sk-ЗАМЕНИТЕ_НА_СВОЙ_КЛЮЧ"
+# ВАЖНО: значение только ASCII — не-ASCII ключ ломает HTTP-заголовки (latin-1).
+DEFAULT_DEEPSEEK_API_KEY = "sk-REPLACE-WITH-YOUR-KEY"
 
 # Схема конфига полностью управляется данными: провайдеры лежат списком в
 # CONFIG["providers"], у каждого — свой base_url, ключ и список моделей.
+# Схема конфига полностью управляется данными: провайдеры лежат списком в
+# CONFIG["providers"], у каждого — свой base_url, ключ и список моделей.
+def _default_hotkey() -> str:
+    # На Windows удобно использовать штатный Win+Shift+S, на Linux — Ctrl+Alt+S.
+    return "windows+shift+s" if IS_WINDOWS else "ctrl+alt+s"
+
+
+def _default_live_hotkey() -> str:
+    return "windows+shift+a" if IS_WINDOWS else "ctrl+alt+a"
+
+
+def _default_tesseract_cmd() -> str:
+    if IS_WINDOWS:
+        return r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    return shutil.which("tesseract") or "/usr/bin/tesseract"
+
+
 DEFAULT_CONFIG = {
     "active_provider": "deepseek",     # id активного провайдера
     "active_model": "deepseek-flash",    # выбранная модель
     "ocr_lang": "eng+rus",
     "ocr_mode": "ai",    # "ai" (нейросеть читает картинку — точнее) | "tesseract" (локальный OCR)
-    "tesseract_cmd": r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    "tesseract_cmd": _default_tesseract_cmd(),
     "source_lang": "авто",
     "target_lang": "русский",
     "request_timeout": 120,
     "add_to_autostart": False,
     "keep_image_on_top": False,
-    "hotkey": "windows+shift+s",
-    "live_hotkey": "windows+shift+a",
+    "hotkey": _default_hotkey(),
+    "live_hotkey": _default_live_hotkey(),
     "providers": [
         {
             "id": "deepseek",
@@ -305,23 +340,37 @@ def get_api_key(provider_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Автозапуск вместе с Windows (реестр HKCU, не требует прав администратора)
+# Автозапуск при входе в систему
+#   Windows — реестр HKCU\...\Run (без прав администратора)
+#   Linux   — ~/.config/autostart/pyAutoImgTranslate.desktop (freedesktop)
 # ---------------------------------------------------------------------------
 AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_REG_NAME = "pyAutoImgTranslate"
+AUTOSTART_DESKTOP = Path.home() / ".config" / "autostart" / "pyAutoImgTranslate.desktop"
+
+
+def _launch_argv() -> list[str]:
+    """Аргументы командной строки для запуска приложения."""
+    if getattr(sys, "frozen", False):
+        return [str(Path(sys.executable).resolve())]
+    return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve())]
 
 
 def _autostart_command() -> str:
-    if getattr(sys, "frozen", False):
-        return f'"{Path(sys.executable).resolve()}"'
-    script = Path(__file__).resolve()
-    python = Path(sys.executable).resolve()
-    pythonw = python.with_name("pythonw.exe")
-    launcher = pythonw if pythonw.is_file() else python
-    return f'"{launcher}" "{script}"'
+    argv = _launch_argv()
+    if IS_WINDOWS:
+        python = Path(argv[0])
+        pythonw = python.with_name("pythonw.exe")
+        if len(argv) == 2 and pythonw.is_file():
+            argv[0] = str(pythonw)
+        return " ".join(f'"{a}"' for a in argv)
+    # Linux: экранируем пробелы для Exec=.
+    return " ".join(f'"{a}"' for a in argv)
 
 
 def is_autostart_enabled() -> bool:
+    if IS_LINUX:
+        return AUTOSTART_DESKTOP.is_file()
     try:
         import winreg
 
@@ -337,18 +386,37 @@ def is_autostart_enabled() -> bool:
 
 def set_autostart(enabled: bool) -> bool:
     try:
-        import winreg
-
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE
-        ) as key:
+        if IS_LINUX:
             if enabled:
-                winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, _autostart_command())
+                AUTOSTART_DESKTOP.parent.mkdir(parents=True, exist_ok=True)
+                AUTOSTART_DESKTOP.write_text(
+                    "[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Name=pyAutoImgTranslate\n"
+                    "Comment=Перевод текста с экрана\n"
+                    f"Exec={_autostart_command()}\n"
+                    "X-GNOME-Autostart-enabled=true\n"
+                    "Terminal=false\n",
+                    encoding="utf-8",
+                )
             else:
                 try:
-                    winreg.DeleteValue(key, AUTOSTART_REG_NAME)
+                    AUTOSTART_DESKTOP.unlink()
                 except FileNotFoundError:
                     pass
+        else:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                if enabled:
+                    winreg.SetValueEx(key, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, _autostart_command())
+                else:
+                    try:
+                        winreg.DeleteValue(key, AUTOSTART_REG_NAME)
+                    except FileNotFoundError:
+                        pass
         CONFIG["add_to_autostart"] = enabled
         save_config(CONFIG)
         logger.info("Автозапуск %s.", "включён" if enabled else "выключен")
@@ -359,7 +427,7 @@ def set_autostart(enabled: bool) -> bool:
 
 
 def ensure_autostart_consistency() -> None:
-    """Синхронизирует реестр с настройкой в config.json при старте."""
+    """Синхронизирует автозапуск с настройкой в config.json при старте."""
     want = bool(CONFIG.get("add_to_autostart"))
     if want and not is_autostart_enabled():
         set_autostart(True)
@@ -459,34 +527,78 @@ def _clean_ocr_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Работа с буфером обмена
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Работа с буфером обмена (Windows: WinAPI/CF_DIB; Linux: xclip/wl-paste)
+# ---------------------------------------------------------------------------
+def _linux_clipboard_tool() -> list[str] | None:
+    """Возвращает команду для чтения картинки из буфера (Wayland → X11)."""
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        return ["wl-paste", "--no-newline", "--type", "image/png"]
+    if shutil.which("xclip"):
+        return ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]
+    if shutil.which("xsel"):
+        return ["xsel", "--clipboard", "--output"]
+    return None
+
+
+def _linux_clipboard_text() -> str:
+    """Текст из буфера — нужен для «номера изменения» (аналога sequence number)."""
+    for cmd in (["wl-paste", "--no-newline"],
+                ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "--clipboard", "--output"]):
+        if shutil.which(cmd[0]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, timeout=3)
+                return out.stdout.decode("utf-8", "ignore")
+            except Exception:  # noqa: BLE001
+                continue
+    return ""
+
+
 def get_image_from_clipboard() -> Image.Image | None:
-    """Получает изображение из буфера обмена (через ImageGrab или CF_DIB)."""
-    image = ImageGrab.grabclipboard()
-    if image and isinstance(image, Image.Image):
-        return image
-
-    data = None
+    """Получает изображение из буфера обмена (кросс-платформенно)."""
+    # PIL умеет читать буфер на Windows и macOS.
     try:
-        win32clipboard.OpenClipboard()
+        image = ImageGrab.grabclipboard()
+        if image and isinstance(image, Image.Image):
+            return image
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ImageGrab.grabclipboard недоступен: %s", exc)
+
+    if IS_LINUX:
+        tool = _linux_clipboard_tool()
+        if tool is None:
+            return None
         try:
-            data = win32clipboard.GetClipboardData(win32con.CF_DIB)
+            out = subprocess.run(tool, capture_output=True, timeout=5)
+            if out.returncode == 0 and out.stdout:
+                return Image.open(io.BytesIO(out.stdout))
         except Exception as exc:  # noqa: BLE001
-            logger.debug("CF_DIB недоступен: %s", exc)
-        finally:
-            win32clipboard.CloseClipboard()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Буфер обмена недоступен: %s", exc)
-
-    if data is None:
+            logger.debug("Не удалось прочитать картинку через %s: %s", tool[0], exc)
         return None
 
-    try:
-        header = b"BM" + struct.pack("<I", len(data) + 14) + b"\x00\x00\x00\x00\x36\x00\x00\x00"
-        image = Image.open(io.BytesIO(header + data))
-        return image
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Не удалось собрать изображение из CF_DIB: %s", exc)
-        return None
+    if IS_WINDOWS:
+        data = None
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                data = win32clipboard.GetClipboardData(win32con.CF_DIB)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("CF_DIB недоступен: %s", exc)
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Буфер обмена недоступен: %s", exc)
+
+        if data is None:
+            return None
+        try:
+            header = b"BM" + struct.pack("<I", len(data) + 14) + b"\x00\x00\x00\x00\x36\x00\x00\x00"
+            return Image.open(io.BytesIO(header + data))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Не удалось собрать изображение из CF_DIB: %s", exc)
+            return None
+    return None
 
 
 def wait_for_clipboard_image(timeout: float = 5.0) -> Image.Image | None:
@@ -501,11 +613,21 @@ def wait_for_clipboard_image(timeout: float = 5.0) -> Image.Image | None:
 
 
 def _clipboard_sequence() -> int:
-    """Номер изменения буфера обмена — растёт при каждом копировании."""
-    try:
-        return int(ctypes.windll.user32.GetClipboardSequenceNumber())
-    except Exception:  # noqa: BLE001
-        return 0
+    """Номер изменения буфера обмена — растёт при каждом копировании.
+
+    Windows — нативный счётчик; Linux — хеш текущего содержимого.
+    """
+    if IS_WINDOWS:
+        try:
+            return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+        except Exception:  # noqa: BLE001
+            return 0
+    if IS_LINUX:
+        try:
+            return hash(_linux_clipboard_text()) & 0x7FFFFFFF
+        except Exception:  # noqa: BLE001
+            return 0
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +814,15 @@ def _chat_completion(messages: list[dict], *, label: str) -> str:
     url, model, api_key = _provider_settings()
     headers = {"Content-Type": "application/json"}
     if api_key:
+        # HTTP-заголовки кодируются в latin-1: не-ASCII ключ (например, русский
+        # плейсхолдер) ломает запрос — отсекаем с понятной ошибкой.
+        try:
+            api_key.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise RuntimeError(
+                "API-ключ содержит не-ASCII символы. Укажите реальный ключ "
+                "(только латиница/цифры) в настройках или через переменную окружения."
+            ) from exc
         headers["Authorization"] = f"Bearer {api_key}"
 
     payload = {
@@ -1566,7 +1697,7 @@ def open_settings_window(parent: tk.Misc | None = None) -> None:
         target_entry.grid(row=1, column=1, sticky="w", padx=Space.XS)
 
         autostart_var = tk.BooleanVar(value=is_autostart_enabled())
-        tk.Checkbutton(common, text="Автозапуск с Windows", variable=autostart_var,
+        tk.Checkbutton(common, text="Автозапуск при входе в систему", variable=autostart_var,
                        **check_opts).grid(row=2, column=0, columnspan=2, sticky="w", pady=(Space.XS, 0))
         on_top_var = tk.BooleanVar(value=bool(CONFIG.get("keep_image_on_top")))
         tk.Checkbutton(common, text="Окно перевода поверх других", variable=on_top_var,
@@ -1890,23 +2021,72 @@ def _test_connection_for(config: dict) -> str:
 process_pending = False
 
 
-def on_hotkey() -> None:
-    """Обработка Win+Shift+S.
+def _linux_capture_screenshot() -> bool:
+    """Запускает инструмент выделения области и кладёт результат в буфер обмена.
 
-    Windows сам открывает оверлей выделения области. Поэтому мы не ждём кликов
-    мышью (как раньше — из-за этого ничего не показывалось), а запоминаем текущий
-    номер буфера обмена и ждём в нём НОВУЮ картинку — результат выделения.
+    Пробует по очереди grim (Wayland), gnome-screenshot, spectacle, scrot, maim,
+    flameshot — что найдётся в системе.
+    """
+    candidates: list[list[str]] = []
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("grim"):
+        # grim без -g делает полный снимок; область — через slurp, если есть.
+        if shutil.which("slurp"):
+            candidates.append(["bash", "-c", "grim -g \"$(slurp)\" - | wl-copy"])
+        candidates.append(["bash", "-c", "grim - | wl-copy"])
+    if shutil.which("gnome-screenshot"):
+        candidates.append(["gnome-screenshot", "-a", "-c"])
+    if shutil.which("spectacle"):
+        candidates.append(["spectacle", "-r", "-n", "-b", "-c"])
+    if shutil.which("flameshot"):
+        candidates.append(["flameshot", "gui", "--clipboard"])
+    if shutil.which("scrot"):
+        candidates.append(["bash", "-c", "scrot -s /tmp/pait_sel.png && "
+                           "(xclip -selection clipboard -t image/png -i /tmp/pait_sel.png || true)"])
+    if shutil.which("maim"):
+        candidates.append(["bash", "-c", "maim -s /tmp/pait_sel.png && "
+                           "(xclip -selection clipboard -t image/png -i /tmp/pait_sel.png || true)"])
+
+    if not candidates:
+        return False
+
+    for cmd in candidates:
+        try:
+            logger.info("Захват области через: %s", cmd[0])
+            subprocess.run(cmd, timeout=120)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось запустить %s: %s", cmd[0], exc)
+            continue
+    return False
+
+
+def on_hotkey() -> None:
+    """Обработка горячей клавиши захвата.
+
+    Система сама открывает оверлей/инструмент выделения области. Мы не ждём
+    кликов мышью, а запоминаем текущее состояние буфера обмена и ждём в нём
+    НОВУЮ картинку — результат выделения.
     """
     global process_pending
     if process_pending:
         return
     process_pending = True
     try:
-        seq_before = _clipboard_sequence()
-        logger.info("Win+Shift+S — жду результат выделения в буфере обмена…")
         progress = _progress()
+
+        # На Linux нет встроенного Win+Shift+S — вызываем выбранный инструмент.
+        if IS_LINUX:
+            progress.build("Захват области…")
+            progress.update(0, "Выделите область")
+            if not _linux_capture_screenshot():
+                _notify("Не найден инструмент скриншотов.\nУстановите один из: grim, "
+                        "gnome-screenshot, spectacle, scrot, maim, flameshot.")
+                return
+
+        seq_before = _clipboard_sequence()
+        logger.info("Горячая клавиша — жду результат выделения в буфере обмена…")
         progress.build("Ожидание выделения…")
-        progress.update(0, "Выделите область в оверлее Windows")
+        progress.update(5, "Выделите область скриншота")
 
         image = None
         start = time.time()
@@ -1967,7 +2147,8 @@ def on_exit(icon, _item) -> None:
     try:
         icon.stop()
     finally:
-        keyboard.unhook_all()
+        if keyboard is not None:
+            keyboard.unhook_all()
         os._exit(0)
 
 
@@ -2009,27 +2190,109 @@ def _build_menu():
 def start_tray_icon() -> None:
     from pystray import Icon
 
-    icon = Icon("pyAutoImgTranslate", create_image_for_tray(), "Перевод с экрана (Win+Shift+S)", _build_menu())
+    # title/name должны быть ASCII-frendly: X11 кодирует имя окна в latin-1.
+    icon = Icon("pyAutoImgTranslate", create_image_for_tray(),
+                "pyAutoImgTranslate", _build_menu())
     icon.run()
+
+
+# ---------------------------------------------------------------------------
+# Глобальные горячие клавиши
+#   Windows — модуль keyboard
+#   Linux   — pynput (X11); при отсутствии — работа в режиме «на лету»/трея
+# ---------------------------------------------------------------------------
+def _parse_hotkey(hotkey: str) -> set[str]:
+    """'ctrl+alt+s' -> {'ctrl','alt','s'} с нормализацией имён."""
+    parts = {p.strip().lower() for p in hotkey.split("+") if p.strip()}
+    alias = {"win": "cmd", "super": "cmd", "windows": "cmd",
+             "control": "ctrl", "escape": "esc"}
+    return {alias.get(p, p) for p in parts}
+
+
+class _LinuxHotkeys:
+    """Слушатель глобальных горячих клавиш через pynput (X11)."""
+
+    def __init__(self) -> None:
+        self._listener = None
+        self._bindings: list[tuple[frozenset[str], object]] = []
+
+    def add(self, hotkey: str, callback) -> bool:
+        try:
+            from pynput import keyboard as pk  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pynput недоступен — горячие клавиши на Linux отключены: %s", exc)
+            return False
+        self._bindings.append((frozenset(_parse_hotkey(hotkey)), callback))
+        if self._listener is None:
+            self._pk = pk
+            self._pressed: set[str] = set()
+            self._listener = pk.Listener(on_press=self._on_press, on_release=self._on_release)
+            self._listener.daemon = True
+            self._listener.start()
+        return True
+
+    def _norm(self, key) -> str | None:
+        pk = self._pk
+        if isinstance(key, pk.Key):
+            name = key.name.lower()
+            return {"ctrl_l": "ctrl", "ctrl_r": "ctrl", "alt_l": "alt", "alt_r": "alt",
+                    "shift_l": "shift", "shift_r": "shift", "cmd_l": "cmd", "cmd_r": "cmd"}.get(name, name)
+        if isinstance(key, pk.KeyCode) and key.char:
+            return key.char.lower()
+        return None
+
+    def _on_press(self, key) -> None:
+        name = self._norm(key)
+        if not name:
+            return
+        self._pressed.add(name)
+        for combo, callback in self._bindings:
+            if combo.issubset(self._pressed):
+                threading.Thread(target=callback, daemon=True).start()
+
+    def _on_release(self, key) -> None:
+        name = self._norm(key)
+        if name:
+            self._pressed.discard(name)
+
+    def wait(self) -> None:
+        while True:
+            time.sleep(3600)
 
 
 # ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
-# Уникальное имя для SingleInstance
+# Уникальное имя/id для SingleInstance
 _MUTEX_NAME = "Global\\pyAutoImgTranslate_SingleInstance"
+_LOCK_FILE = Path.home() / ".cache" / "pyAutoImgTranslate.lock"
 
 
 def _already_running() -> bool:
     """Возвращает True, если копия приложения уже запущена."""
-    try:
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
-        if not handle:
+    if IS_WINDOWS:
+        try:
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+            if not handle:
+                return False
+            if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+                return True
+            setattr(_already_running, "_handle", handle)  # удерживаем дескриптор
             return False
-        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        except Exception:  # noqa: BLE001
+            return False
+    # Linux/macOS — файловая блокировка через flock.
+    try:
+        import fcntl  # type: ignore
+
+        _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(_LOCK_FILE, "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
             return True
-        setattr(_already_running, "_handle", handle)  # удерживаем дескриптор
+        setattr(_already_running, "_fh", fh)  # удерживаем дескриптор
         return False
     except Exception:  # noqa: BLE001
         return False
@@ -2037,8 +2300,8 @@ def _already_running() -> bool:
 
 def main() -> None:
     setup_logging()
-    logger.info("Запуск pyAutoImgTranslate. Провайдер=%s, модель=%s",
-                CONFIG.get("active_provider"), CONFIG.get("active_model"))
+    logger.info("Запуск pyAutoImgTranslate. ОС=%s, провайдер=%s, модель=%s",
+                sys.platform, CONFIG.get("active_provider"), CONFIG.get("active_model"))
 
     if _already_running():
         logger.warning("Приложение уже запущено — второй экземпляр не стартует.")
@@ -2049,21 +2312,32 @@ def main() -> None:
     tray_thread = threading.Thread(target=start_tray_icon, daemon=True)
     tray_thread.start()
 
-    hotkey = CONFIG.get("hotkey", "windows+shift+s")
-    live_hotkey = CONFIG.get("live_hotkey", "windows+shift+a")
-    try:
-        keyboard.add_hotkey(hotkey, lambda: threading.Thread(target=on_hotkey, daemon=True).start())
-        logger.info("Горячая клавиша перевода %s зарегистрирована.", hotkey)
+    hotkey = CONFIG.get("hotkey", _default_hotkey())
+    live_hotkey = CONFIG.get("live_hotkey", _default_live_hotkey())
+
+    if IS_WINDOWS:
         try:
-            keyboard.add_hotkey(live_hotkey, _toggle_live_from_hotkey)
-            logger.info("Горячая клавиша режима «на лету» %s зарегистрирована.", live_hotkey)
+            keyboard.add_hotkey(hotkey, lambda: threading.Thread(target=on_hotkey, daemon=True).start())
+            logger.info("Горячая клавиша перевода %s зарегистрирована.", hotkey)
+            try:
+                keyboard.add_hotkey(live_hotkey, _toggle_live_from_hotkey)
+                logger.info("Горячая клавиша режима «на лету» %s зарегистрирована.", live_hotkey)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось зарегистрировать %s: %s", live_hotkey, exc)
+            logger.info("Приложение в трее.")
+            keyboard.wait()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Не удалось зарегистрировать %s: %s", live_hotkey, exc)
+            logger.error("Не удалось зарегистрировать горячую клавишу '%s': %s", hotkey, exc)
+            raise SystemExit(1)
+    else:
+        # Linux: pynput, а при его отсутствии — живём без хоткеев (трей + live).
+        hotkeys = _LinuxHotkeys()
+        ok = hotkeys.add(hotkey, lambda: threading.Thread(target=on_hotkey, daemon=True).start())
+        if ok:
+            logger.info("Горячая клавиша перевода %s зарегистрирована (pynput).", hotkey)
+            hotkeys.add(live_hotkey, _toggle_live_from_hotkey)
         logger.info("Приложение в трее.")
-        keyboard.wait()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Не удалось зарегистрировать горячую клавишу '%s': %s", hotkey, exc)
-        raise SystemExit(1)
+        hotkeys.wait()
 
 
 def _toggle_live_from_hotkey() -> None:

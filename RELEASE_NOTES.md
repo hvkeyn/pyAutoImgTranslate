@@ -1,6 +1,27 @@
 # pyAutoImgTranslate — Release Notes
 
-## v1.5.0
+## v1.6.0
+
+Кросс-платформенность: релиз для Windows и Linux (Debian), исправления, найденные
+на реальном запуске под Debian.
+
+### Добавлено
+
+- **Поддержка Linux (Debian/Ubuntu).** Автоопределение ОС: горячие клавиши `Ctrl+Alt+S` /
+  `Ctrl+Alt+A`, буфер обмена через `xclip`/`xsel`/`wl-paste`, захват области через
+  `grim`/`gnome-screenshot`/`spectacle`/`scrot`/`maim`/`flameshot`, автозапуск
+  через `~/.config/autostart/*.desktop`, глобальные хоткеи через `pynput`,
+  единый экземпляр через файловую блокировку.
+- **Скрипты сборки:** `build.sh` (Linux) и `build.bat` (Windows).
+- **Релизы:** `pyAutoImgTranslate.exe` (Windows) и `pyAutoImgTranslate` (Linux).
+
+### Исправлено (найдено при тестировании под Debian)
+
+- **Не-ASCII API-ключ ломал HTTP-заголовки** (`latin-1`) — теперь ключ проверяется,
+  а плейсхолдер по умолчанию сделан ASCII, с понятной ошибкой.
+- **Краш трея на X11** из-за кириллицы в title иконки — имя сделано ASCII.
+
+### Возможности (с v1.5.0)
 
 Исправлен захват Win+Shift+S, добавлено окно прогресса, единое окно настроек и баланс API.
 
