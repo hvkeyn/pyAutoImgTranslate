@@ -1,0 +1,13 @@
+# Зависимости pyAutoImgTranslate (пиновано под .venv проекта)
+keyboard==0.13.5
+mouse==0.7.1
+numpy==2.2.3
+opencv-python==4.11.0.86
+pillow==11.1.0
+pystray==0.19.5
+pytesseract==0.3.13
+pywin32==309
+requests==2.32.3
+
+# Только для сборки релиза
+pyinstaller==6.12.0
