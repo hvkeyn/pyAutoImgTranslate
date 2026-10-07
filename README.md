@@ -38,6 +38,38 @@ colors or spacings:
 
 All windows use only these tokens, keeping spacing, color and typography consistent.
 
+## Platforms
+
+Works on **Windows** and **Linux (Debian/Ubuntu and other distros)**.
+
+| Feature | Windows | Linux |
+| --- | --- | --- |
+| Capture area | `Win+Shift+S` (native snipping overlay) | `Ctrl+Alt+S` (calls grim/gnome-screenshot/spectacle/scrot/maim/flameshot) |
+| Clipboard image | WinAPI / CF_DIB | `xclip` / `xsel` / `wl-paste` |
+| Global hotkeys | `keyboard` | `pynput` (X11) |
+| Autostart | Registry `HKCU\...\Run` | `~/.config/autostart/*.desktop` |
+| Tray | pystray (win32) | pystray (xorg/appindicator) |
+
+On Debian/Ubuntu install the basics:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-pip python3-venv python3-tk \
+    libgl1 libglib2.0-0 tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
+    xclip
+# optional screenshot backends: gnome-screenshot / spectacle / scrot / maim / flameshot / grim+slurp
+```
+
+## Building a release
+
+```bash
+# Linux
+./build.sh            # -> dist/pyAutoImgTranslate
+
+# Windows
+build.bat             # -> dist\pyAutoImgTranslate.exe
+```
+
 ## Configuration
 
 Everything is **data-driven**: there is no hardcoded list of providers or models. The
