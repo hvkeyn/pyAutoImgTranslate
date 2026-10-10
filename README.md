@@ -2,18 +2,23 @@ pyAutoImgTranslate is a utility that automatically translates text from screensh
 
 ## Main functions
 
-- Screenshot of the area: Activated by pressing Win+Shift+S to select the desired area of the screen.
+- Screenshot of the area: pressing the hotkey freezes the screen and shows a full-screen overlay where you drag the region — the built-in selector, just like Win+Shift+S (all monitors, `Esc` / right click cancels, the size is shown while dragging). The system capture (Windows Snipping Tool / `grim`, `scrot`, … on Linux) stays available as the `system` mode and is used automatically if the screen cannot be grabbed. Mode: `capture_mode` (`builtin` / `system`).
 - OCR with rectification: Text recognition with automatic tilt correction (deskew) using Tesseract and OpenCV, with garbage-line cleanup (`eng+rus`).
 - OCR/translation: By default the **neural network reads the image directly** (vision) and returns a faithful translation — no Tesseract needed. A local **Tesseract** mode is also available. Toggle with `ocr_mode` (`ai` / `tesseract`).
+- No-text guard: before any API request the capture is checked locally. A cheap structural test rejects empty captures instantly (solid fills, gradients, noise, plain photos); anything that looks like a text line is then confirmed by a quick local OCR pass (Tesseract, LSTM, downscaled to 1100 px). If the OCR is unavailable the capture is processed anyway, so a translation is never lost — and for text on a very busy background the option can be switched off. Toggle with `skip_no_text`.
+- Cancellable: an **Отмена** button in the progress plate, an **Отменить** button in the result window and **Отменить обработку** in the tray menu all abort the current job; the HTTP connection is closed immediately, so there is no wait for the end of generation. Pressing the capture hotkey again cancels the previous job and starts a new capture (re-shoot).
+- Streaming translation: the answer is read as a stream (SSE) and the text grows in the result window as it is generated; in vision mode the `ПЕРЕВОД` block comes first, so the translation is what you see, while the original stays on the **Оригинал** tab. Toggle with `stream_results`.
 - Translation: Any number of AI providers over one OpenAI-compatible interface (DeepSeek cloud, local LM Studio, custom servers). Providers and their models are added/edited/removed live from the settings window — nothing is hardcoded. The prompt asks for a **faithful, close-to-original** translation that preserves structure.
-- Live mode ("на лету"): when enabled, any new image that lands in the clipboard is OCR'd and translated automatically — no need to press the hotkey first. Toggle from the tray or with `Win+Shift+A`.
-- Progress window: a small always-on-top "hourglass" panel with a stage label, a smoothly animated percentage (0→100%), a progress bar, and an **ETA** (elapsed + estimated time remaining), shown while capturing, recognizing and translating.
+- Live mode ("на лету"): when enabled, any new image that lands in the clipboard is OCR'd and translated automatically — no need to press the hotkey first. A new capture immediately supersedes the one being processed; identical images are not reprocessed. Toggle from the tray or with `Win+Shift+A`.
+- Progress window: a small always-on-top "hourglass" panel with a stage label, a smoothly animated percentage (0→100%), a progress bar, an **ETA** (elapsed + estimated time remaining) and a **Cancel** button, shown while capturing, recognizing and translating.
+- Toast notifications: messages ("no text on the capture", "processing cancelled", errors) appear as a small non-blocking plate in the corner, never steal focus and disappear by themselves.
 - Single settings window: opening settings from the tray or from the result window never creates a duplicate — it raises the existing one.
 - Balance display: for cloud providers (DeepSeek) the settings window shows the current API balance (e.g. "Баланс API: 12.34 USD") with a refresh button.
-- User-friendly interface: a compact result window with the screenshot on the left and a tidy, scrollable translation block on the right; switch between **Перевод / Оригинал** (`Ctrl+O`) and copy everything (`Ctrl+C`) or a selection.
-- Autostart: Optional launch together with Windows, toggled from the tray menu or the Settings window (stored in `HKCU\...\CurrentVersion\Run`).
+- User-friendly interface: a compact result window with the screenshot on the left and a tidy, scrollable translation block on the right; switch between **Перевод / Оригинал** (`Ctrl+O`) and copy everything (`Ctrl+C`) or a selection. Sizes and position are computed from the work area of the monitor under the cursor, and on narrow screens the image and the text stack vertically.
+- Autostart: Optional launch together with Windows, toggled from the tray menu or the Settings window (stored in `HKCU\...\CurrentVersion\Run`). A stale entry (the app moved) is rewritten automatically at startup.
 - Working in the background: The application runs in the system tray; single-instance guard prevents duplicates.
-- Logging: Rotating log file `pyAutoImgTranslate.log` next to the executable.
+- Logging: Rotating log file `pyAutoImgTranslate.log` next to the executable. Recognized screen text is **not** written to it by default (`log_recognized_text`); the log records stages, sizes and errors, and never the API key.
+- Speed: the built-in selector opens in ~0.15 s (screen grab) with no full-screen image copied into the UI, so dragging the frame costs well under a millisecond per mouse move; captures do not accumulate memory.
 
 ## Technologies used
 
@@ -44,11 +49,17 @@ Works on **Windows** and **Linux (Debian/Ubuntu and other distros)**.
 
 | Feature | Windows | Linux |
 | --- | --- | --- |
-| Capture area | `Win+Shift+S` (native snipping overlay) | `Ctrl+Alt+S` (calls grim/gnome-screenshot/spectacle/scrot/maim/flameshot) |
+| Built-in area selector | yes (full-screen frozen overlay, `Win+Shift+X` by default) | yes on X11 (falls back to system tools if the screen cannot be grabbed) |
+| Capture area (system mode) | `Win+Shift+S` (native snipping overlay) | `Ctrl+Alt+S` (calls grim/gnome-screenshot/spectacle/scrot/maim/flameshot) |
 | Clipboard image | WinAPI / CF_DIB | `xclip` / `xsel` / `wl-paste` |
 | Global hotkeys | `keyboard` | `pynput` (X11) |
 | Autostart | Registry `HKCU\...\Run` | `~/.config/autostart/*.desktop` |
 | Tray | pystray (win32) | pystray (xorg/appindicator) |
+
+> `Win+Shift+S` belongs to Windows itself — it cannot be re-bound, and pressing it
+> opens the system Snipping Tool. In `builtin` mode the app therefore uses
+> `Win+Shift+X` (or `Ctrl+Alt+X` on Linux); set your own combination in the
+> `hotkey` field of `config.json`.
 
 On Debian/Ubuntu install the basics:
 
@@ -65,7 +76,7 @@ sudo apt-get install -y python3 python3-pip python3-venv python3-tk \
 ```bash
 # Linux
 ./build.sh            # -> dist/pyAutoImgTranslate
-./build_deb.sh 1.6.0  # -> dist/pyautoimgtranslate_1.6.0_<arch>.deb
+./build_deb.sh 1.7.0  # -> dist/pyautoimgtranslate_1.7.0_<arch>.deb
 
 # Windows
 build.bat             # -> dist\pyAutoImgTranslate.exe
@@ -74,7 +85,7 @@ build.bat             # -> dist\pyAutoImgTranslate.exe
 ### Install the .deb (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./pyautoimgtranslate_1.6.0_amd64.deb
+sudo apt install ./pyautoimgtranslate_1.7.0_amd64.deb
 # then run:  pyautoimgtranslate   (or launch from the applications menu)
 ```
 
@@ -102,6 +113,28 @@ The settings window lets you:
 - **Проверить** — sends a short test request and shows the result/error inline.
 - **Открыть config.json** — saves and opens the config file for manual editing.
 
+Check boxes in the settings window control `add_to_autostart`, `keep_image_on_top`,
+`live_on_top`, `skip_no_text` and `stream_results`.
+
+### Cancelling and re-shooting
+
+Processing can be interrupted at any moment: with the **Отмена** button in the
+progress plate, with **Отменить** in the result window, from the tray
+(**Отменить обработку**) or by simply pressing the capture hotkey again — a new
+capture always supersedes the previous one, and the open HTTP request is closed
+immediately.
+
+## Tests
+
+Offline checks (no network needed, Tesseract is used locally for the no-text
+filter):
+
+```bash
+python tests/test_offline.py          # no-text filter, stream parsing, jobs, OCR grouping
+python tests/test_gui_smoke.py        # result window / progress plate / toasts in real Tk
+python tests/test_translation_flow.py # streaming + cancellation against a local stub server
+```
+
 All windows run inside a single dedicated Tk thread, so opening settings from the tray
 or the result window is safe (no second `Tk()` root).
 
@@ -114,13 +147,21 @@ or the result window is safe (no second `Tk()` root).
 | `providers[]` | Array of providers (see below) | DeepSeek / LM Studio / custom |
 | `ocr_mode` | `ai` (vision через нейросеть) или `tesseract` (локальный OCR) | `ai` |
 | `ocr_lang` | Tesseract languages (только для `tesseract`) | `eng+rus` |
+| `min_ocr_confidence` | Minimum mean OCR confidence to treat a capture as text | `40` |
 | `tesseract_cmd` | Path to `tesseract.exe` | `C:\Program Files\Tesseract-OCR\tesseract.exe` |
 | `source_lang` | Source language hint | `авто` |
 | `target_lang` | Translation target language | `русский` |
 | `request_timeout` | HTTP timeout, seconds | `120` |
+| `skip_no_text` | Skip captures without any text (no API request) | `true` |
+| `stream_results` | Show the translation while it is being generated | `true` |
+| `live_on_top` | Keep the live-mode result window always on top | `true` |
+| `capture_timeout` | Seconds to wait for the area selection | `60` |
+| `capture_mode` | `builtin` — own full-screen selector, `system` — system screenshot tool | `builtin` (Windows) |
+| `capture_dim` | How much the screen is dimmed while selecting (`0` — no dimming) | `0.45` |
+| `log_recognized_text` | Write recognized screen text to the log file | `false` |
 | `add_to_autostart` | Launch with Windows | `false` |
 | `keep_image_on_top` | Result window always on top | `false` |
-| `hotkey` | Global hotkey: capture area → OCR → translate | `windows+shift+s` |
+| `hotkey` | Global hotkey: capture area → OCR → translate (in `builtin` mode `Win+Shift+S` is replaced by `Win+Shift+X`) | `windows+shift+s` |
 | `live_hotkey` | Toggle live mode | `windows+shift+a` |
 
 Each entry in `providers[]` looks like:
@@ -152,6 +193,12 @@ For each provider the key is resolved in this order:
    (`DEFAULT_DEEPSEEK_API_KEY` in `main.py`) — **replace it with your own key**.
 
 The key is sent as `Authorization: Bearer <key>`. Never commit a real key to a public repository.
+
+On Windows the environment variable is also looked up in the registry (`HKCU\Environment`,
+then the machine environment) when the process itself does not see it — that happens
+when the app was started by a shortcut that predates the variable, or by Task
+Scheduler. At startup the log records where the key came from (never the key itself),
+and a 401 without any key is reported as "API-ключ не найден".
 
 ---
 
