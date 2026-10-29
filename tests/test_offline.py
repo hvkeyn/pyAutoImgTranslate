@@ -421,12 +421,137 @@ def test_autostart_helpers() -> None:
     check("автозапуск: устаревание не падает", isinstance(app.autostart_is_stale(), bool))
 
 
+def test_analysis_parsing() -> None:
+    """Разбор ответа модели для анализа: описание, запросы, источники."""
+    cases = [
+        ("Кот на клавиатуре.\n\nПОИСК:\n- кот на клавиатуре\n- почему коты лежат на клавиатуре",
+         ("Кот на клавиатуре.", ["кот на клавиатуре", "почему коты лежат на клавиатуре"])),
+        ("Кот на клавиатуре. ПОИСК: - кот на клавиатуре", ("Кот на клавиатуре.", ["кот на клавиатуре"])),
+        ("Просто описание без поиска.", ("Просто описание без поиска.", [])),
+        ("Описание...\nПОИСК: НЕТ", ("Описание...", [])),
+        ("Описание\nПОИСК:\n1. товар\n2) цена\n• отзывы\n- отзывы",
+         ("Описание", ["товар", "цена", "отзывы"])),
+        ("", ("", [])),
+    ]
+    for raw, expected in cases:
+        got = app.split_description_and_queries(raw)
+        check(f"анализ: деление {raw[:24]!r}", got == expected, f"-> {got!r} != {expected!r}")
+
+    _, queries = app.split_description_and_queries(
+        "Описание\nПОИСК:\n- раз\n- два\n- три\n- четыре")
+    check("анализ: не больше трёх запросов", len(queries) == 3, repr(queries))
+
+    check("анализ: незавершённый маркер не ломает показ",
+          app.visible_analysis_text("Кот на клавиатуре. ПОИ") == "Кот на клавиатуре. ПОИ")
+    check("анализ: блок поиска отрезан",
+          app.visible_analysis_text("Кот.\nПОИСК:\n- кот") == "Кот.")
+    check("анализ: inline-блок отрезан",
+          app.visible_analysis_text("Кот на клавиатуре. ПОИСК:\n- кот") == "Кот на клавиатуре.")
+
+    check("анализ: компоновка с ответом",
+          app.compose_analysis_text("Кот.", "Это животное.") == "Кот.\n\nПодробнее:\nЭто животное.")
+    check("анализ: компоновка без ответа", app.compose_analysis_text("Кот.", "") == "Кот.")
+
+    sources = [
+        {"title": "A &amp; B", "url": "https://a.b/c"},
+        {"title": "C", "url": "https://d.e/x?y=1"},
+    ]
+    formatted = app.format_sources(sources)
+    check("анализ: источники отформатированы",
+          formatted.startswith("1. A & B\n   https://a.b/c"), repr(formatted))
+
+    merged = app.merge_search_results(
+        [[{"url": "https://a/#frag", "title": "A"}],
+         [{"url": "https://a/%23frag", "title": "A2"}, {"url": "https://b", "title": "B"}],
+         [{"url": "https://b/", "title": "B2"}]])
+    check("анализ: повторы источников убраны", [item["url"] for item in merged] ==
+          ["https://a/#frag", "https://b"], repr(merged))
+
+    check("анализ: мусорный результат отброшен",
+          not app.result_is_relevant("Sony WH-1000XM5 цена",
+                                     {"title": "Протаргол — цена", "snippet": "инструкция",
+                                      "url": "https://medum.ru"}))
+    check("анализ: результат по теме оставлен",
+          app.result_is_relevant("Илон Маск",
+                                 {"title": "Илон Маск — биография", "snippet": "Илон Маск",
+                                  "url": "https://rbc.ru"}))
+    check("анализ: длинное слово запроса достаточно",
+          app.result_is_relevant("наушники Sony", {"title": "Наушники купить", "snippet": "",
+                                                   "url": "https://ozon.ru"}))
+
+    rss = ("<?xml version='1.0'?><rss><channel>"
+           "<item><title>Заголовок &amp; ещё</title><link>https://site/1</link>"
+           "<description>&lt;b&gt;Сниппет&lt;/b&gt; текста</description></item>"
+           "<item><title>Второй</title><link>https://site/2</link>"
+           "<description>Текст</description></item>"
+           "</channel></rss>")
+    parsed = app.parse_bing_rss(rss)
+    check("поиск: RSS разобран", len(parsed) == 2, repr(parsed))
+    check("поиск: сущности и теги убраны",
+          bool(parsed) and parsed[0]["title"] == "Заголовок & ещё"
+          and parsed[0]["snippet"] == "Сниппет текста", repr(parsed[0] if parsed else None))
+
+    ddg = ('<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fsite%2Fx">'
+           'Заголовок</a><a class="result__snippet">Описание</a>')
+    parsed_ddg = app.parse_ddg_html(ddg)
+    check("поиск: DDG разобран",
+          bool(parsed_ddg) and parsed_ddg[0]["url"] == "https://site/x", repr(parsed_ddg))
+
+    vision = app._build_analysis_messages(Image.new("RGB", (10, 10), "white"))
+    has_image = any(isinstance(part, dict) and part.get("type") == "image_url"
+                    for message in vision for part in
+                    (message["content"] if isinstance(message["content"], list) else []))
+    check("анализ: в промпте есть картинка", has_image)
+    check("анализ: в промпте просят блок ПОИСК", "ПОИСК" in vision[0]["content"])
+
+    with_sources = app._build_search_answer_messages("Описание", sources)
+    no_sources = app._build_search_answer_messages("Описание", [])
+    check("анализ: источники попали в запрос", "https://a.b/c" in with_sources[1]["content"])
+    check("анализ: без источников просят быть честным",
+          "не нашлось" in no_sources[1]["content"])
+
+
+def test_search_layer() -> None:
+    """Слой поиска: кэш, объединение источников, пустой запрос."""
+    check("поиск: пустой запрос", app.web_search("") == [])
+
+    original_wiki = app.wikipedia_search
+    original_bing = app.bing_search
+    app._SEARCH_CACHE.clear()
+    calls = {"wiki": 0, "bing": 0}
+
+    def fake_wiki(query: str, limit: int = 2):
+        calls["wiki"] += 1
+        return [{"title": f"{query} — Википедия", "url": f"https://wiki/{query}",
+                 "snippet": "кратко"}]
+
+    def fake_bing(query: str, limit: int = 4):
+        calls["bing"] += 1
+        return [{"title": f"{query} — сайт", "url": f"https://site/{query}",
+                 "snippet": "описание"}]
+
+    app.wikipedia_search = fake_wiki
+    app.bing_search = fake_bing
+    try:
+        first = app.web_search("тестовый запрос", 4)
+        second = app.web_search("тестовый запрос", 4)
+        check("поиск: источники собраны", len(first) == 2, repr(first))
+        check("поиск: повторный вызов из кэша",
+              second == first and calls["wiki"] == 1 and calls["bing"] == 1, repr(calls))
+        app.web_search("", 4)
+        check("поиск: пустой запрос не ходит в сеть", calls["wiki"] == 1, repr(calls))
+    finally:
+        app.wikipedia_search = original_wiki
+        app.bing_search = original_bing
+        app._SEARCH_CACHE.clear()
+
+
 def main() -> int:
     print("Офлайн-проверки pyAutoImgTranslate")
     for test in (test_text_presence, test_real_photos, test_split_blocks, test_no_text_answers,
                  test_stream_visible_text, test_stream_completion, test_jobs,
                  test_ocr_data_grouping, test_api_key_sources, test_capture_mode_helpers,
-                 test_autostart_helpers):
+                 test_analysis_parsing, test_search_layer, test_autostart_helpers):
         print(f"\n== {test.__name__}")
         test()
     print("\n".join(REPORT))

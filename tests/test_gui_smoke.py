@@ -266,6 +266,78 @@ def test_settings_window() -> None:
         app.fetch_balance = original_balance
 
 
+def test_analysis_window() -> None:
+    """Окно анализа: заголовок, вкладки «Ответ / Источники», кликабельные ссылки."""
+    job = app._new_job("hotkey", "analyze")
+    gen = job.gen
+    image = sample_image()
+    sources = "1. Sony — Википедия\n   https://ru.wikipedia.org/wiki/Sony"
+    try:
+        app._result_partial(gen, "Скриншот карточки товара", image=image, focus=False,
+                            on_top=False, kind="analysis")
+        check("анализ: окно открылось", wait_for(app._result_alive))
+        check("анализ: окно помечено как анализ", app._RESULT.get("kind") == "analysis")
+        labels = widget_texts(app._RESULT["win"])
+        check("анализ: заголовок окна", any("Анализ изображения" in t for t in labels),
+              repr(labels[:12]))
+        check("анализ: вкладки «Ответ» и «Источники»",
+              "Ответ" in labels and "Источники" in labels, repr(labels[:12]))
+
+        app._result_done(gen, image,
+                         "Скриншот карточки товара\n\nПодробнее:\nЭто наушники Sony.",
+                         sources, focus=False, on_top=False, kind="analysis")
+        check("анализ: финальный текст",
+              wait_for(lambda: "Подробнее" in (app._RESULT["translation"] or "")),
+              repr(app._RESULT.get("translation")))
+
+        def show_sources() -> None:
+            app._RESULT["mode"] = "source"
+            app._render_result(gen)
+
+        app.run_on_ui(show_sources)
+        widget = app._RESULT["text"]
+        check("анализ: источники во вкладке",
+              wait_for(lambda: "wikipedia.org" in widget.get("1.0", "end")))
+        check("анализ: ссылка кликабельная", len(widget.tag_ranges("link")) >= 2,
+              repr(widget.tag_ranges("link")))
+    finally:
+        app.run_on_ui(lambda: app._result_alive() and app._RESULT["win"].destroy())
+        app._finish_job(job)
+
+
+def test_analysis_hotkey_dispatch() -> None:
+    """Клавиши перевода и анализа ведут в разные обработчики."""
+    calls: list[tuple[str, str]] = []
+    original = {
+        "select": app.select_region_interactive,
+        "analysis": app.process_analysis,
+        "translate": app.process_image,
+        "mode": app.CONFIG.get("capture_mode"),
+    }
+    app.CONFIG["capture_mode"] = "builtin"
+    app.select_region_interactive = lambda job=None: (sample_image(), "ok")
+    app.process_analysis = lambda image, job=None: calls.append(("analysis", job.purpose))
+    app.process_image = lambda image, job=None: calls.append(("translate", job.purpose))
+    try:
+        app.on_hotkey_analyze()
+        check("клавиша анализа: уходит в анализ", calls == [("analysis", "analyze")], repr(calls))
+        calls.clear()
+        app.on_hotkey()
+        check("клавиша перевода: уходит в перевод", calls == [("translate", "translate")],
+              repr(calls))
+        calls.clear()
+        app.on_hotkey_analyze()
+        app.on_hotkey()
+        check("обе клавиши не мешают друг другу",
+              calls == [("analysis", "analyze"), ("translate", "translate")], repr(calls))
+    finally:
+        app.select_region_interactive = original["select"]
+        app.process_analysis = original["analysis"]
+        app.process_image = original["translate"]
+        app.CONFIG["capture_mode"] = original["mode"]
+        app.cancel_current_job("завершение теста")
+
+
 def main() -> int:
     print("Проверка интерфейса (Tk)")
     image = sample_image()
@@ -333,6 +405,8 @@ def main() -> int:
     test_capture_region_builtin()
     test_region_overlay()
     test_overlay_speed()
+    test_analysis_window()
+    test_analysis_hotkey_dispatch()
     test_settings_window()
 
     print(f"\nПровалов: {len(FAILURES)}")

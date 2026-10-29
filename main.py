@@ -31,7 +31,12 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
+import xml.etree.ElementTree as ElementTree
+from concurrent.futures import ThreadPoolExecutor
+from html import unescape as unescape_html
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
@@ -43,7 +48,7 @@ import requests
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageGrab, ImageTk
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
@@ -139,6 +144,11 @@ def _default_builtin_hotkey() -> str:
     return "windows+shift+x" if IS_WINDOWS else "ctrl+alt+x"
 
 
+def _default_analyze_hotkey() -> str:
+    """Клавиша анализа снимка (описание + поиск в интернете)."""
+    return "windows+shift+i" if IS_WINDOWS else "ctrl+alt+i"
+
+
 # Сочетания, которые Windows обрабатывает сама (их нельзя занять).
 SYSTEM_CAPTURE_HOTKEYS = {"windows+shift+s", "win+shift+s", "cmd+shift+s", "super+shift+s"}
 
@@ -170,8 +180,12 @@ DEFAULT_CONFIG = {
     "capture_mode": "builtin" if IS_WINDOWS else "system",
     "capture_dim": 0.45,        # затемнение экрана при своём выделении (0 — без затемнения)
     "log_recognized_text": False,   # писать распознанный текст в журнал (по умолчанию нет)
+    "analyze_web_search": True,     # при анализе снимка искать информацию в интернете
+    "search_results": 4,            # сколько результатов брать с одного поискового запроса
+    "search_timeout": 8,            # таймаут одного поискового запроса, секунды
     "hotkey": _default_hotkey(),
     "live_hotkey": _default_live_hotkey(),
+    "analyze_hotkey": _default_analyze_hotkey(),
     "providers": [
         {
             "id": "deepseek",
@@ -471,6 +485,19 @@ def effective_hotkey() -> str:
     hotkey = (CONFIG.get("hotkey") or _default_hotkey()).strip()
     if capture_mode() == "builtin" and hotkey.lower() in SYSTEM_CAPTURE_HOTKEYS:
         return _default_builtin_hotkey()
+    return hotkey
+
+
+def effective_analyze_hotkey() -> str:
+    """Действующая клавиша анализа. Не должна совпадать с клавишей перевода."""
+    hotkey = (CONFIG.get("analyze_hotkey") or _default_analyze_hotkey()).strip()
+    if hotkey.lower() in SYSTEM_CAPTURE_HOTKEYS:
+        hotkey = _default_analyze_hotkey()
+    if hotkey.lower() == effective_hotkey().lower():
+        fallback = _default_analyze_hotkey()
+        if fallback.lower() != effective_hotkey().lower():
+            logger.warning("Клавиша анализа совпала с клавишей перевода — беру %s.", fallback)
+            return fallback
     return hotkey
 
 
@@ -1111,10 +1138,11 @@ class Cancelled(Exception):
 class Job:
     """Одна операция «захват → распознавание → перевод»."""
 
-    __slots__ = ("kind", "gen", "cancel", "created")
+    __slots__ = ("kind", "purpose", "gen", "cancel", "created")
 
-    def __init__(self, kind: str, gen: int) -> None:
+    def __init__(self, kind: str, gen: int, purpose: str = "translate") -> None:
         self.kind = kind                 # "hotkey" (по клавише) | "live" («на лету»)
+        self.purpose = purpose           # "translate" | "analyze"
         self.gen = gen                   # номер задачи, растёт с каждым захватом
         self.cancel = threading.Event()
         self.created = time.time()
@@ -1141,11 +1169,11 @@ _CURRENT_JOB: "Job | None" = None
 _job_http: dict[int, object] = {}
 
 
-def _new_job(kind: str) -> Job:
+def _new_job(kind: str, purpose: str = "translate") -> Job:
     """Начинает новую задачу, прерывая предыдущую (перес-скриншот = отмена)."""
     global _CURRENT_JOB
     with _job_lock:
-        previous, _CURRENT_JOB = _CURRENT_JOB, Job(kind, next(_job_seq))
+        previous, _CURRENT_JOB = _CURRENT_JOB, Job(kind, next(_job_seq), purpose)
         job = _CURRENT_JOB
     if previous is not None and not previous.cancel.is_set():
         previous.cancel.set()
@@ -1760,6 +1788,506 @@ def _strip_model_noise(content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Анализ снимка: описание содержимого + поиск в интернете, если он нужен.
+#
+# Два прохода: сначала vision-модель описывает кадр и предлагает поисковые
+# запросы (или говорит, что поиск не нужен), затем мы ищем в интернете и
+# просим модель ответить уже по найденным источникам. Так не нужны
+# tool-calls и работает с любым OpenAI-совместимым сервером.
+# ---------------------------------------------------------------------------
+SEARCH_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+# Википедия требует осмысленный User-Agent с названием программы.
+WIKI_USER_AGENT = "pyAutoImgTranslate (screenshot analysis; github.com/hvkeyn/pyAutoImgTranslate)"
+TERM_RE = re.compile(r"[0-9a-zа-яё]{3,}")
+SEARCH_MARKER = re.compile(r"(?im)^[ \t]*(?:поиск|search)[ \t]*:[ \t]*")
+# Иногда модель пишет «…текст. ПОИСК: …» в той же строке — тоже понимаем.
+INLINE_SEARCH_MARKER = re.compile(r"(?is)(?<=[.!?])\s+(?:поиск|search)\s*:")
+# Что показывать, пока модель ещё печатает блок поиска.
+ANALYSIS_MARKERS = ("поиск", "search")
+NO_SEARCH_WORDS = {"нет", "не нужен", "не нужно", "не требуется", "none", "no", "n/a"}
+
+
+class AnalysisResult:
+    """Результат анализа снимка: описание, запросы, ответ и источники."""
+
+    __slots__ = ("description", "queries", "answer", "sources")
+
+    def __init__(self) -> None:
+        self.description = ""
+        self.queries: list[str] = []
+        self.answer = ""
+        self.sources: list[dict] = []
+
+    def __repr__(self) -> str:
+        return (f"AnalysisResult(description={len(self.description)} симв., "
+                f"queries={len(self.queries)}, answer={len(self.answer)} симв., "
+                f"sources={len(self.sources)})")
+
+
+def _strip_html_tags(text: str) -> str:
+    """Убирает теги и лишние пробелы из сниппета или заголовка."""
+    cleaned = re.sub(r"<[^>]+>", " ", text or "")
+    cleaned = unescape_html(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def find_search_marker(text: str):
+    """Находит начало блока «ПОИСК:» в ответе модели (None, если блока нет)."""
+    if not text:
+        return None
+    return SEARCH_MARKER.search(text) or INLINE_SEARCH_MARKER.search(text)
+
+
+def split_description_and_queries(text: str) -> tuple[str, list[str]]:
+    """Делит ответ модели на описание и список поисковых запросов.
+
+    Ожидаемый формат: описание, затем блок «ПОИСК:» со строками «- запрос»
+    либо «ПОИСК: НЕТ», если поиск не нужен.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", []
+    match = find_search_marker(text)
+    if match is None:
+        return text, []
+    description = text[:match.start()].strip()
+    rest = text[match.end():].strip()
+    queries: list[str] = []
+    lines = rest.splitlines() if rest else []
+    for line in lines:
+        value = line.strip()
+        if not value:
+            continue
+        # Метки списков: «- », «• », «1. », «1) ».
+        value = re.sub(r"^[\-\u2022\*•]+\s*", "", value)
+        value = re.sub(r"^\d+[\.\)]\s*", "", value).strip()
+        if not value:
+            continue
+        lowered = value.lower().strip(" .!»\"'")
+        if lowered in NO_SEARCH_WORDS or lowered.startswith("нет "):
+            return description, []
+        if len(value) >= 3:
+            queries.append(value[:120])
+    # Убираем повторы, сохраняя порядок, и ограничиваем число запросов.
+    unique: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        key = query.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(query)
+    return description, unique[:3]
+
+
+def visible_analysis_text(raw: str) -> str:
+    """Показывает описание, пока модель ещё не дописала блок «ПОИСК»."""
+    text = raw or ""
+    if not text.strip():
+        return ""
+    match = find_search_marker(text)
+    if match is not None:
+        text = text[:match.start()]
+    lines = text.split("\n")
+    while lines:
+        candidate = re.sub(r"[^0-9a-zа-яё]+", "", lines[-1].strip().lower())
+        if candidate and any(word.startswith(candidate) for word in ANALYSIS_MARKERS):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
+def compose_analysis_text(description: str, answer: str) -> str:
+    """Собирает текст окна: описание и, если есть, подробный ответ."""
+    description = (description or "").strip()
+    answer = (answer or "").strip()
+    if description and answer:
+        return f"{description}\n\nПодробнее:\n{answer}"
+    return answer or description
+
+
+def _build_analysis_messages(image: Image.Image) -> list[dict]:
+    lang = CONFIG.get("target_lang", "русский") or "русский"
+    system = (
+        f"Ты внимательный помощник. Посмотри на снимок экрана и опиши на {lang} языке, "
+        "что на нём: 2–4 предложения, по делу, без вступлений вроде «на изображении показано».\n"
+        "Если на снимке есть то, что полезно уточнить в интернете (конкретный товар, модель, "
+        "место, человек, игра, фильм, программа, ошибка, цена, характеристики, новость), "
+        "добавь в конце отдельный блок строго такого вида:\n"
+        "ПОИСК:\n- запрос 1\n- запрос 2\n"
+        "Запросы короткие, как для поисковой строки, не больше трёх.\n"
+        "Если поиск не нужен, напиши вместо блока: ПОИСК: НЕТ\n"
+        "Ничего больше не добавляй."
+    )
+    user = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Что на этом снимке?"},
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(image)}},
+        ],
+    }
+    return [{"role": "system", "content": system}, user]
+
+
+def _build_search_answer_messages(description: str, sources: list[dict]) -> list[dict]:
+    lang = CONFIG.get("target_lang", "русский") or "русский"
+    if sources:
+        blocks = []
+        for index, item in enumerate(sources, 1):
+            blocks.append(f"[{index}] {item.get('title', '')}\n{item.get('url', '')}\n"
+                          f"{item.get('snippet', '')}")
+        search_part = "Результаты поиска в интернете:\n" + "\n\n".join(blocks)
+        instruction = ("Опирайся на результаты поиска, если они относятся к делу, и ссылайся "
+                       "на источники номерами в квадратных скобках: [1], [2].")
+    else:
+        search_part = "Результаты поиска: по теме ничего не нашлось."
+        instruction = ("Отвечай из общих знаний, но честно скажи, что проверить в интернете "
+                       "не удалось, и не выдумывай точные факты — цены, даты, характеристики.")
+    system = (
+        f"Ты помощник, который отвечает на {lang} языке по фактам.\n"
+        "Пользователь смотрит на изображение. Ниже описание изображения и данные поиска.\n"
+        "Дай короткий полезный ответ: что это и что важно знать.\n"
+        + instruction + "\n"
+        "Не выдумывай факты, не добавляй вступлений и извинений."
+    )
+    user = (f"Описание изображения:\n{description}\n\n{search_part}\n\n"
+            "Что это и что полезно знать?")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+# --- Поиск в интернете ------------------------------------------------------
+def _proxy_configured() -> bool:
+    return any(os.environ.get(name) for name in ("HTTPS_PROXY", "https_proxy",
+                                                 "HTTP_PROXY", "http_proxy"))
+
+
+def _search_request(url: str, params: dict, *, user_agent: str = SEARCH_USER_AGENT):
+    """GET для поиска: сначала напрямую, потом через прокси из окружения.
+
+    Прокси может быть мёртвым (или наоборот — единственным путём в интернет),
+    поэтому пробуем оба варианта, а не полагаемся на настройки системы.
+    Ответ 4xx прокси не исправит — на нём сразу останавливаемся.
+    """
+    headers = {"User-Agent": user_agent,
+               "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
+    timeout = float(CONFIG.get("search_timeout") or 8)
+    attempts: list[dict] = [{"proxies": {"http": None, "https": None}}]
+    if _proxy_configured():
+        attempts.append({})
+    for options in attempts:
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=timeout,
+                                    **options)
+        except requests.RequestException as exc:
+            logger.info("Поиск: %s недоступен (%s).", url, exc.__class__.__name__)
+            continue
+        if response.status_code == 200:
+            return response
+        logger.info("Поиск: %s ответил %s.", url, response.status_code)
+        if 400 <= response.status_code < 500:
+            return None                 # прокси тут не поможет
+    return None
+
+
+# Ответы поиска кэшируем: повторный анализ того же кадра не должен снова
+# дёргать сеть (это и быстрее, и меньше риска упереться в лимит запросов).
+_SEARCH_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_SEARCH_CACHE_TTL = 600.0
+
+
+def _cached_search(query: str) -> list[dict] | None:
+    cached = _SEARCH_CACHE.get(query.lower())
+    if cached is None:
+        return None
+    created, results = cached
+    if time.time() - created > _SEARCH_CACHE_TTL:
+        _SEARCH_CACHE.pop(query.lower(), None)
+        return None
+    return results
+
+
+def query_terms(query: str) -> list[str]:
+    """Значимые слова запроса — по ним проверяем, что выдача по теме."""
+    terms = []
+    for term in TERM_RE.findall((query or "").lower()):
+        if term not in terms:
+            terms.append(term)
+    return terms[:8]
+
+
+def result_is_relevant(query: str, result: dict) -> bool:
+    """Относится ли результат к запросу.
+
+    Нужен из-за поисковиков: на редкие запросы они иногда отдают «замещающую»
+    выдачу (случайные страницы). Такой мусор нельзя отдавать модели — она
+    начнёт отвечать не по теме.
+
+    Совпасть должно либо два слова запроса, либо одно длинное (6+ букв) —
+    специфичное. Одно общее слово вроде «цена» ничего не доказывает.
+    """
+    terms = query_terms(query)
+    if not terms:
+        return True
+    haystack = " ".join(str(result.get(key, "")) for key in ("title", "snippet", "url")).lower()
+    matched = [term for term in terms if term[:5] in haystack]
+    if not matched:
+        return False
+    if len(matched) >= 2:
+        return True
+    return len(matched[0]) >= 6
+
+
+def parse_bing_rss(xml_text: str) -> list[dict]:
+    """Разбирает RSS-выдачу Bing: заголовок, ссылка, сниппет."""
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError as exc:
+        logger.info("Поиск: не удалось разобрать RSS (%s).", exc)
+        return []
+    results = []
+    for item in root.iter("item"):
+        title = _strip_html_tags(item.findtext("title") or "")
+        url = (item.findtext("link") or "").strip()
+        snippet = _strip_html_tags(item.findtext("description") or "")
+        if title and url.startswith("http"):
+            results.append({"title": title, "url": url, "snippet": snippet})
+    return results
+
+
+def parse_ddg_html(markup: str) -> list[dict]:
+    """Разбирает HTML-выдачу DuckDuckGo (резервный источник)."""
+    results = []
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=<a[^>]+class="result__a"|$)',
+        re.S)
+    for match in pattern.finditer(markup or ""):
+        url = unescape_html(match.group(1)).strip()
+        redirect = re.search(r"[?&]uddg=([^&]+)", url)
+        if redirect:
+            url = unquote(redirect.group(1))
+        title = _strip_html_tags(match.group(2))
+        snippet_match = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', match.group(3), re.S)
+        snippet = _strip_html_tags(snippet_match.group(1)) if snippet_match else ""
+        if title and url.startswith("http"):
+            results.append({"title": title, "url": url, "snippet": snippet})
+    return results
+
+
+def bing_search(query: str, limit: int = 4) -> list[dict]:
+    """Поиск через Bing (RSS) с отсевом нерелевантной («замещающей») выдачи."""
+    response = _search_request("https://www.bing.com/search",
+                               {"q": query, "format": "rss", "count": str(limit)})
+    if response is None:
+        return []
+    parsed = parse_bing_rss(response.text)
+    relevant = [item for item in parsed if result_is_relevant(query, item)]
+    if parsed and not relevant:
+        logger.info("Поиск (Bing): выдача не по теме — отбрасываю %d результатов.", len(parsed))
+    return relevant[:limit]
+
+
+def wikipedia_search(query: str, limit: int = 2) -> list[dict]:
+    """Ищет статьи в Википедии и берёт краткое содержание.
+
+    Википедия здесь самый надёжный источник: отдаёт статьи по запросу без
+    капчи и подмены выдачи, а для «что это такое» этого обычно достаточно.
+    """
+    for lang in ("ru", "en"):
+        api = f"https://{lang}.wikipedia.org/w/api.php"
+        response = _search_request(
+            api, {"action": "query", "list": "search", "srsearch": query, "format": "json",
+                  "srlimit": str(limit), "utf8": 1}, user_agent=WIKI_USER_AGENT)
+        if response is None:
+            continue
+        try:
+            found = (response.json().get("query") or {}).get("search") or []
+        except ValueError:
+            continue
+        titles = [str(item.get("title") or "") for item in found][:limit]
+        titles = [title for title in titles if title]
+        if not titles:
+            continue
+        summaries = _wikipedia_summaries(lang, titles)
+        if summaries:
+            return summaries
+    return []
+
+
+def _wikipedia_summaries(lang: str, titles: list[str]) -> list[dict]:
+    """Забирает вступления найденных статей."""
+    api = f"https://{lang}.wikipedia.org/w/api.php"
+    response = _search_request(
+        api, {"action": "query", "titles": "|".join(titles), "prop": "extracts",
+              "exintro": 1, "explaintext": 1, "format": "json",
+              "exlimit": str(len(titles))}, user_agent=WIKI_USER_AGENT)
+    if response is None:
+        return []
+    try:
+        pages = ((response.json().get("query") or {}).get("pages") or {})
+    except ValueError:
+        return []
+    results = []
+    for page in pages.values():
+        title = str(page.get("title") or "").strip()
+        extract = str(page.get("extract") or "").strip()
+        if not title or not extract:
+            continue
+        results.append({
+            "title": f"{title} — Википедия",
+            "url": f"https://{lang}.wikipedia.org/wiki/" + quote(title.replace(" ", "_")),
+            "snippet": re.sub(r"\s+", " ", extract)[:400],
+        })
+    return results
+
+
+def merge_search_results(groups: list[list[dict]], limit: int = 6) -> list[dict]:
+    """Объединяет выдачу по нескольким запросам без повторов ссылок."""
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            # Один и тот же адрес может прийти с разным процентным кодированием.
+            url = unquote(item.get("url") or "").strip().rstrip("/")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            merged.append(item)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def format_sources(sources: list[dict], limit: int = 8) -> str:
+    """Список источников для вкладки «Источники»."""
+    lines = []
+    for index, item in enumerate(sources[:limit], 1):
+        title = _strip_html_tags(item.get("title", "")) or item.get("url", "")
+        lines.append(f"{index}. {title}\n   {item.get('url', '')}")
+    return "\n".join(lines)
+
+
+def web_search(query: str, limit: int | None = None) -> list[dict]:
+    """Ищет информацию: Википедия (надёжно) + Bing (с проверкой релевантности)."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        limit = int(limit or CONFIG.get("search_results") or 4)
+    except (TypeError, ValueError):
+        limit = 4
+    limit = max(1, min(10, limit))
+    cached = _cached_search(query)
+    if cached is not None:
+        return cached[:limit]
+    results = wikipedia_search(query, limit=min(2, limit))
+    if len(results) < limit:
+        results.extend(bing_search(query, limit=limit - len(results)))
+    results = merge_search_results([results], limit)
+    _SEARCH_CACHE[query.lower()] = (time.time(), results)
+    if bool(CONFIG.get("log_recognized_text")):
+        logger.info("Поиск «%s»: %d источников.", query, len(results))
+    else:
+        logger.info("Поиск: %d источников, запрос %d симв.", len(results), len(query))
+    return results
+
+
+def analyze_image_via_ai(image: Image.Image, *, job: "Job | None" = None,
+                         on_delta=None, on_stage=None) -> "AnalysisResult":
+    """Описывает снимок и, если нужно, ищет информацию в интернете.
+
+    on_delta(raw, part) — куски ответа: part="description" или "answer".
+    on_stage(text) — этап для плашки прогресса.
+    """
+    result = AnalysisResult()
+
+    def push_description(raw: str) -> None:
+        if on_delta is not None:
+            on_delta(raw, "description")
+
+    raw = _chat_completion(_build_analysis_messages(image), label="Анализ изображения",
+                           job=job, on_delta=push_description)
+    result.description, result.queries = split_description_and_queries(raw)
+    if not result.description:
+        result.description = _strip_html_tags(raw)
+    logger.info("Анализ: описание %d симв., запросов %d.",
+                len(result.description), len(result.queries))
+
+    if not result.queries or not bool(CONFIG.get("analyze_web_search", True)):
+        return result
+
+    if on_stage is not None:
+        on_stage("Ищу в интернете…")
+    queries = result.queries[:3]
+    # Запросы независимы — выполняем их параллельно, чтобы ожидание было
+    # не «суммой», а максимумом по времени.
+    with ThreadPoolExecutor(max_workers=max(1, len(queries))) as pool:
+        groups = list(pool.map(web_search, queries))
+    if job is not None:
+        job.check()
+    result.sources = merge_search_results(groups)
+    logger.info("Анализ: источников найдено %d.", len(result.sources))
+
+    if on_stage is not None:
+        on_stage("Пишу ответ…")
+
+    def push_answer(raw_answer: str) -> None:
+        if on_delta is not None:
+            on_delta(raw_answer, "answer")
+
+    result.answer = _chat_completion(
+        _build_search_answer_messages(result.description, result.sources),
+        label="Ответ по результатам поиска", job=job, on_delta=push_answer)
+    logger.info("Анализ: ответ %d симв.", len(result.answer))
+    return result
+
+
+def process_analysis(image: Image.Image, job: "Job | None" = None) -> None:
+    """Пайплайн анализа: описание + интернет → окно с ответом и источниками."""
+    if job is None:
+        job = _new_job("hotkey", "analyze")
+    logger.info("Задача #%d: анализ снимка %dx%d.", job.gen, *image.size)
+    progress = _progress()
+    progress.build("Смотрю на снимок…", owner=job.gen)
+    progress.update(10, "Смотрю на снимок…", owner=job.gen)
+    on_top = _result_on_top(job)
+    parts = {"description": "", "answer": "", "last_push": 0.0}
+
+    def push(raw: str, part: str) -> None:
+        if part == "description":
+            parts["description"] = visible_analysis_text(raw)
+        else:
+            parts["answer"] = (raw or "").strip()
+        text = compose_analysis_text(parts["description"], parts["answer"])
+        if not text:
+            return
+        now = time.time()
+        if now - parts["last_push"] < 0.12:      # не чаще ~8 раз в секунду
+            return
+        parts["last_push"] = now
+        _result_partial(job.gen, text, image=image, focus=job.interactive,
+                        on_top=on_top, kind="analysis")
+
+    def stage(text: str) -> None:
+        progress.update(70, text, owner=job.gen)
+
+    job.check()
+    result = analyze_image_via_ai(image, job=job, on_delta=push, on_stage=stage)
+    job.check()
+    text = compose_analysis_text(result.description, result.answer)
+    if not text.strip():
+        logger.info("Задача #%d: не удалось ничего понять о снимке.", job.gen)
+        _result_abort(job.gen)
+        _toast("Не удалось распознать, что на снимке")
+        return
+    progress.finish("Готово", owner=job.gen)
+    _result_done(job.gen, image, text, format_sources(result.sources),
+                 focus=job.interactive, on_top=on_top, kind="analysis")
+    logger.info("Задача #%d: анализ готов (%d симв., источников %d).",
+                job.gen, len(text), len(result.sources))
+
+
+# ---------------------------------------------------------------------------
 # Дизайн-система (токены)
 #
 # Мини-дизайн-система для tkinter: единые цветовые роли, шкала отступов
@@ -2230,16 +2758,67 @@ _RESULT: dict = {
     "cancel": None,       # кнопка «Отменить» (показывается во время обработки)
     "var": None,          # StringVar переключателя «Перевод / Оригинал»
     "gen": None,          # номер задачи, которой принадлежит окно
+    "kind": "translation",  # "translation" | "analysis"
     "mode": "translation",
     "translation": "",
     "source": "",
     "streaming": False,
 }
 
+# Ссылки в тексте ответа: делаем их кликабельными.
+LINK_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+LINK_TRAILING = ".,;:!?)]}»\"'"
 
-def _result_title() -> str:
+
+def _result_title(kind: str = "translation") -> str:
+    if kind == "analysis":
+        return "Анализ изображения"
     mode_label = "нейросеть" if CONFIG.get("ocr_mode", "ai") == "ai" else "Tesseract"
     return f"Перевод · {mode_label}"
+
+
+def _open_link(event) -> None:
+    """Открывает ссылку, по которой щёлкнули в окне результата."""
+    widget = event.widget
+    try:
+        index = widget.index(f"@{event.x},{event.y}")
+        ranges = widget.tag_ranges("link")
+    except tk.TclError:
+        return
+    for start, end in zip(ranges[::2], ranges[1::2]):
+        try:
+            inside = (widget.compare(start, "<=", index) and widget.compare(index, "<", end))
+        except tk.TclError:
+            continue
+        if inside:
+            url = widget.get(start, end).strip()
+            logger.info("Открываю ссылку из результата: %s", url)
+            try:
+                webbrowser.open(url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось открыть ссылку: %s", exc)
+            return
+
+
+def _tag_links(widget: tk.Text) -> None:
+    """Подсвечивает и делает кликабельными ссылки в тексте."""
+    try:
+        content = widget.get("1.0", tk.END)
+        widget.tag_configure("link", foreground=Color.PRIMARY, underline=True)
+        for match in LINK_PATTERN.finditer(content):
+            url = match.group(0)
+            while url and url[-1] in LINK_TRAILING:
+                url = url[:-1]
+            if len(url) <= len("https://"):
+                continue
+            start = f"1.0+{match.start()}c"
+            end = f"1.0+{match.start() + len(url)}c"
+            widget.tag_add("link", start, end)
+        widget.tag_bind("link", "<Button-1>", _open_link)
+        widget.tag_bind("link", "<Enter>", lambda _e: widget.configure(cursor="hand2"))
+        widget.tag_bind("link", "<Leave>", lambda _e: widget.configure(cursor="arrow"))
+    except tk.TclError:
+        pass
 
 
 def _result_alive() -> bool:
@@ -2265,7 +2844,7 @@ def _text_rows(area_h: int, image_h: int, stacked: bool) -> int:
 
 
 def _open_result_window(image: Image.Image, gen: int, *, focus: bool, on_top: bool,
-                        streaming: bool) -> None:
+                        streaming: bool, kind: str = "translation") -> None:
     """Создаёт окно результата (вызывается только в UI-потоке)."""
     global _result_window
     if _result_alive():
@@ -2276,12 +2855,12 @@ def _open_result_window(image: Image.Image, gen: int, *, focus: bool, on_top: bo
     _result_window = None
     _RESULT.update({"win": None, "text": None, "title": None, "cancel": None, "var": None,
                     "mode": "translation", "translation": "", "source": "",
-                    "streaming": streaming, "gen": gen})
+                    "streaming": streaming, "gen": gen, "kind": kind})
 
     win = tk.Toplevel(_ui_root)
     _result_window = win
     _RESULT["win"] = win
-    win.title("Перевод с экрана")
+    win.title("Анализ снимка" if kind == "analysis" else "Перевод с экрана")
     win.configure(bg=Color.SURFACE)
     win.attributes("-topmost", bool(on_top))
     win.bind("<Escape>", lambda _e: win.destroy())
@@ -2314,7 +2893,7 @@ def _open_result_window(image: Image.Image, gen: int, *, focus: bool, on_top: bo
     right.rowconfigure(2, weight=1)
     right.columnconfigure(0, weight=1)
 
-    title = tk.Label(right, text=_result_title(), bg=Color.SURFACE,
+    title = tk.Label(right, text=_result_title(kind), bg=Color.SURFACE,
                      fg=Color.TEXT_ON_DARK, font=Font.TITLE, anchor="w")
     title.grid(row=0, column=0, sticky="ew")
     _RESULT["title"] = title
@@ -2326,8 +2905,11 @@ def _open_result_window(image: Image.Image, gen: int, *, focus: bool, on_top: bo
         _RESULT["mode"] = view_var.get()
         _render_result(gen)
 
-    seg = _segmented(right, [("translation", "Перевод"), ("source", "Оригинал")],
-                     view_var, command=on_view)
+    if kind == "analysis":
+        segments = [("translation", "Ответ"), ("source", "Источники")]
+    else:
+        segments = [("translation", "Перевод"), ("source", "Оригинал")]
+    seg = _segmented(right, segments, view_var, command=on_view)
     seg.grid(row=1, column=0, sticky="w", pady=(Space.SM, Space.SM))
 
     # Карточка текста.
@@ -2382,7 +2964,7 @@ def _open_result_window(image: Image.Image, gen: int, *, focus: bool, on_top: bo
 
     def on_cancel() -> None:
         if cancel_current_job("кнопка в окне перевода"):
-            title.configure(text=f"{_result_title()} · отмена…")
+            title.configure(text=f"{_result_title(kind)} · отмена…")
             logger.info("Отмена из окна перевода.")
 
     # --- Панель действий ---
@@ -2426,6 +3008,7 @@ def _render_result(gen: int, *, autoscroll: bool = False) -> None:
         widget.configure(state="normal")
         widget.delete("1.0", tk.END)
         widget.insert(tk.END, text)
+        _tag_links(widget)
         widget.configure(state="disabled")
         if autoscroll and _RESULT["mode"] == "translation":
             widget.see(tk.END)
@@ -2446,14 +3029,15 @@ def _hide_result_cancel(gen: int) -> None:
 
 
 def _result_partial(gen: int, text: str, *, image: Image.Image, focus: bool,
-                    on_top: bool) -> None:
-    """Промежуточный перевод: окно появляется на первом же куске ответа."""
+                    on_top: bool, kind: str = "translation") -> None:
+    """Промежуточный текст: окно появляется на первом же куске ответа."""
     if not _is_active_job(gen):
         return
 
     def build() -> None:
         if _RESULT.get("gen") != gen or not _result_alive():
-            _open_result_window(image, gen, focus=focus, on_top=on_top, streaming=True)
+            _open_result_window(image, gen, focus=focus, on_top=on_top, streaming=True,
+                                kind=kind)
         if _RESULT.get("gen") != gen:
             return
         _RESULT["translation"] = text
@@ -2463,14 +3047,16 @@ def _result_partial(gen: int, text: str, *, image: Image.Image, focus: bool,
 
 
 def _result_done(gen: int, image: Image.Image, translation: str, source_text: str = "",
-                 *, focus: bool = True, on_top: bool = False) -> None:
-    """Финальный перевод: окно создаётся, если поток так и не начался."""
+                 *, focus: bool = True, on_top: bool = False,
+                 kind: str = "translation") -> None:
+    """Финальный текст: окно создаётся, если поток так и не начался."""
     if not _is_active_job(gen):
         return
 
     def build() -> None:
         if _RESULT.get("gen") != gen or not _result_alive():
-            _open_result_window(image, gen, focus=focus, on_top=on_top, streaming=False)
+            _open_result_window(image, gen, focus=focus, on_top=on_top, streaming=False,
+                                kind=kind)
         if _RESULT.get("gen") != gen:
             return
         _RESULT["translation"] = translation
@@ -2482,7 +3068,7 @@ def _result_done(gen: int, image: Image.Image, translation: str, source_text: st
             var.set("translation")
         title = _RESULT.get("title")
         if title is not None:
-            title.configure(text=_result_title())
+            title.configure(text=_result_title(kind))
         _render_result(gen)
         _hide_result_cancel(gen)
 
@@ -2490,7 +3076,7 @@ def _result_done(gen: int, image: Image.Image, translation: str, source_text: st
 
 
 def _mark_result_cancelled(gen: int) -> None:
-    """Помечает окно как «отменено»: частичный перевод остаётся на экране."""
+    """Помечает окно как «отменено»: частичный текст остаётся на экране."""
     def build() -> None:
         if _RESULT.get("gen") != gen or not _result_alive():
             return
@@ -2498,7 +3084,7 @@ def _mark_result_cancelled(gen: int) -> None:
         title = _RESULT.get("title")
         if title is not None:
             try:
-                title.configure(text=f"{_result_title()} · отменено")
+                title.configure(text=f"{_result_title(_RESULT.get('kind', 'translation'))} · отменено")
             except tk.TclError:
                 pass
         _render_result(gen)
@@ -2780,6 +3366,16 @@ def open_settings_window(parent: tk.Misc | None = None) -> None:
         capture_seg.pack(side="left", padx=Space.SM)
         capture_hint.pack(side="left", padx=(Space.SM, 0))
 
+        # Анализ снимка: поиск в интернете и подсказка о клавише.
+        search_var = tk.BooleanVar(value=bool(CONFIG.get("analyze_web_search", True)))
+        tk.Checkbutton(common, text="При анализе искать в интернете", variable=search_var,
+                       **check_opts).grid(row=6, column=0, columnspan=2, sticky="w",
+                                          pady=(Space.XS, 0))
+        analyze_hint = tk.Label(
+            common, text=f"анализ: {effective_analyze_hotkey()}", bg=Color.SURFACE,
+            fg=Color.TEXT_ON_DARK_MUTED, font=Font.CAPTION)
+        analyze_hint.grid(row=6, column=2, columnspan=2, sticky="w", pady=(Space.XS, 0))
+
         status = tk.Label(win, text="", bg=Color.SURFACE, fg=Color.ACCENT, anchor="w",
                           justify="left", wraplength=600, font=Font.CAPTION)
         status.pack(fill="x", padx=Space.MD)
@@ -2964,6 +3560,7 @@ def open_settings_window(parent: tk.Misc | None = None) -> None:
             draft["skip_no_text"] = bool(skip_no_text_var.get())
             draft["stream_results"] = bool(stream_var.get())
             draft["capture_mode"] = capture_var.get() or capture_mode_of(draft)
+            draft["analyze_web_search"] = bool(search_var.get())
             draft["active_model"] = active_model_var.get().strip() or draft.get("active_model", "")
 
         # --- Тест соединения на текущих полях (на лету) ---
@@ -3010,6 +3607,7 @@ def open_settings_window(parent: tk.Misc | None = None) -> None:
             skip_no_text_var.set(bool(draft.get("skip_no_text", True)))
             stream_var.set(bool(draft.get("stream_results", True)))
             capture_var.set(capture_mode_of(draft))
+            search_var.set(bool(draft.get("analyze_web_search", True)))
             update_capture_hint()
             refresh_providers_list()
             load_selected_into_fields()
@@ -3545,22 +4143,35 @@ def select_region_interactive(job: "Job | None" = None) -> tuple["Image.Image | 
 
 
 def on_hotkey() -> None:
-    """Горячая клавиша: ждём новую картинку в буфере обмена и обрабатываем её.
+    """Горячая клавиша перевода: выделяем область и переводим текст с неё."""
+    _capture_and_run("translate")
+
+
+def on_hotkey_analyze() -> None:
+    """Горячая клавиша анализа: описываем снимок и ищем информацию в интернете."""
+    _capture_and_run("analyze")
+
+
+def _capture_and_run(purpose: str) -> None:
+    """Общий путь для обеих клавиш: захват области → перевод или анализ.
 
     Повторное нажатие во время ожидания или обработки отменяет предыдущую
     задачу — можно спокойно переснять область. Обработку также можно прервать
-    кнопкой «Отмена» в плашке прогресса, в окне перевода или из меню трея.
+    кнопкой «Отмена» в плашке прогресса, в окне результата или из меню трея.
     """
-    job = _new_job("hotkey")
+    job = _new_job("hotkey", purpose)
     progress = _progress()
     try:
         image = _capture_region(job, progress)
         if image is None:
             return
         logger.info("Задача #%d: снимок получен (%dx%d).", job.gen, *image.size)
-        process_image(image, job)
+        if purpose == "analyze":
+            process_analysis(image, job)
+        else:
+            process_image(image, job)
     except Cancelled:
-        logger.info("Задача #%d отменена до начала перевода.", job.gen)
+        logger.info("Задача #%d отменена до начала обработки.", job.gen)
         _toast("Обработка отменена", kind="warn")
     except RuntimeError as exc:
         logger.error("Задача #%d: %s", job.gen, exc)
@@ -3797,12 +4408,23 @@ def _apply_topmost_to_result() -> None:
     run_on_ui(build)
 
 
+def on_capture_translate(icon, _item) -> None:
+    """Пункт меню: захват области и перевод."""
+    threading.Thread(target=on_hotkey, daemon=True).start()
+
+
+def on_capture_analyze(icon, _item) -> None:
+    """Пункт меню: захват области и анализ (описание + интернет)."""
+    threading.Thread(target=on_hotkey_analyze, daemon=True).start()
+
+
 def _build_menu():
     from pystray import Menu, MenuItem
 
     return Menu(
         MenuItem(f"pyAutoImgTranslate {APP_VERSION}", on_settings),
-        MenuItem(f"Перевод области — {effective_hotkey()}", on_settings),
+        MenuItem(f"Перевод области — {effective_hotkey()}", on_capture_translate),
+        MenuItem(f"Анализ области — {effective_analyze_hotkey()}", on_capture_analyze),
         Menu.SEPARATOR,
         MenuItem("Режим «на лету»", on_toggle_live, checked=lambda _i: is_live_mode()),
         MenuItem("Отменить обработку", on_cancel_job,
@@ -3949,9 +4571,10 @@ def main() -> None:
     tray_thread.start()
 
     hotkey = effective_hotkey()
+    analyze_hotkey = effective_analyze_hotkey()
     live_hotkey = CONFIG.get("live_hotkey", _default_live_hotkey())
-    logger.info("Режим выделения области: %s, клавиша перевода: %s.",
-                capture_mode(), hotkey)
+    logger.info("Режим выделения области: %s, клавиша перевода: %s, анализа: %s.",
+                capture_mode(), hotkey, analyze_hotkey)
     if hotkey != (CONFIG.get("hotkey") or _default_hotkey()):
         logger.info("Клавиша из настроек (%s) занята системным скриншотом — "
                     "использую %s.", CONFIG.get("hotkey"), hotkey)
@@ -3960,6 +4583,13 @@ def main() -> None:
         try:
             keyboard.add_hotkey(hotkey, lambda: threading.Thread(target=on_hotkey, daemon=True).start())
             logger.info("Горячая клавиша перевода %s зарегистрирована.", hotkey)
+            try:
+                keyboard.add_hotkey(
+                    analyze_hotkey,
+                    lambda: threading.Thread(target=on_hotkey_analyze, daemon=True).start())
+                logger.info("Горячая клавиша анализа %s зарегистрирована.", analyze_hotkey)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось зарегистрировать %s: %s", analyze_hotkey, exc)
             try:
                 keyboard.add_hotkey(live_hotkey, _toggle_live_from_hotkey)
                 logger.info("Горячая клавиша режима «на лету» %s зарегистрирована.", live_hotkey)
@@ -3976,6 +4606,8 @@ def main() -> None:
         ok = hotkeys.add(hotkey, lambda: threading.Thread(target=on_hotkey, daemon=True).start())
         if ok:
             logger.info("Горячая клавиша перевода %s зарегистрирована (pynput).", hotkey)
+            hotkeys.add(analyze_hotkey,
+                        lambda: threading.Thread(target=on_hotkey_analyze, daemon=True).start())
             hotkeys.add(live_hotkey, _toggle_live_from_hotkey)
         logger.info("Приложение в трее.")
         hotkeys.wait()

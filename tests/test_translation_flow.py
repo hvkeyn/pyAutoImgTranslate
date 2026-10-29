@@ -26,7 +26,8 @@ from PIL import Image  # noqa: E402
 import main as app  # noqa: E402
 
 FAILURES: list[str] = []
-STATE: dict = {"pieces": ["Привет"], "delay": 0.0, "mode": "stream", "requests": 0}
+STATE: dict = {"pieces": ["Привет"], "delay": 0.0, "mode": "stream", "requests": 0,
+               "vision_pieces": [], "text_pieces": [], "bodies": []}
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -45,7 +46,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         payload = json.loads(self.rfile.read(length) or b"{}")
         STATE["requests"] += 1
+        STATE["bodies"].append(json.dumps(payload, ensure_ascii=False))
         want_stream = bool(payload.get("stream"))
+
+        # Анализ делает два запроса: сначала картинка, потом текст с источниками.
+        has_image = any(isinstance(message.get("content"), list)
+                        for message in payload.get("messages") or [])
+        pieces = STATE["vision_pieces"] if has_image and STATE["vision_pieces"] \
+            else STATE["text_pieces"] if STATE["text_pieces"] else STATE["pieces"]
 
         if STATE["mode"] == "unauthorized":
             body = b'{"error": {"message": "invalid key"}}'
@@ -59,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
-            for piece in STATE["pieces"]:
+            for piece in pieces:
                 chunk = json.dumps({"choices": [{"delta": {"content": piece}}]})
                 try:
                     self.wfile.write(f"data: {chunk}\n\n".encode("utf-8"))
@@ -75,7 +83,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
 
-        body = json.dumps({"choices": [{"message": {"content": "".join(STATE["pieces"])}}]},
+        body = json.dumps({"choices": [{"message": {"content": "".join(pieces)}}]},
                           ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -196,10 +204,65 @@ def test_cancel_closes_request() -> None:
         server.shutdown()
 
 
+def test_analysis_flow() -> None:
+    """Анализ снимка: описание → поиск → ответ по источникам (два запроса к модели)."""
+    server, base_url = start_server()
+    original, _ = use_stub_provider(base_url)
+    original_search = app.web_search
+    try:
+        STATE.update({
+            "mode": "stream", "delay": 0.02, "bodies": [],
+            "vision_pieces": ["Скриншот карточки товара.\n\nПОИСК:\n- наушники Sony"],
+            "text_pieces": ["Это наушники Sony [1].\nЦена и характеристики стоит проверить."],
+        })
+        app._SEARCH_CACHE.clear()
+        searched: list[str] = []
+
+        def fake_search(query: str, limit: int | None = None) -> list[dict]:
+            searched.append(query)
+            return [{"title": "Sony — Википедия", "url": "https://sony.example/wiki",
+                     "snippet": "Sony — японская корпорация"}]
+
+        app.web_search = fake_search
+        job = app._new_job("hotkey", "analyze")
+        deltas: list[str] = []
+        stages: list[str] = []
+        result = app.analyze_image_via_ai(
+            Image.new("RGB", (120, 60), "white"), job=job,
+            on_delta=lambda raw, part: deltas.append(part),
+            on_stage=stages.append)
+        app._finish_job(job)
+
+        check("анализ: описание получено", "карточки товара" in result.description,
+              repr(result.description))
+        check("анализ: запросы выделены", result.queries == ["наушники Sony"], repr(result.queries))
+        check("анализ: поиск выполнен", searched == ["наушники Sony"], repr(searched))
+        check("анализ: источники сохранены",
+              bool(result.sources) and result.sources[0]["url"] == "https://sony.example/wiki",
+              repr(result.sources))
+        check("анализ: ответ получен", "Sony" in result.answer, repr(result.answer))
+        check("анализ: этапы показаны", "Ищу в интернете…" in stages and "Пишу ответ…" in stages,
+              repr(stages))
+        check("анализ: поток размечен по частям",
+              set(deltas) == {"description", "answer"}, repr(set(deltas)))
+        check("анализ: источники ушли в запрос к модели",
+              any("sony.example" in body for body in STATE["bodies"]),
+              f"запросов: {len(STATE['bodies'])}")
+        text = app.compose_analysis_text(result.description, result.answer)
+        check("анализ: текст окна собран", text.startswith("Скриншот карточки") and "Подробнее:" in text,
+              repr(text[:80]))
+    finally:
+        app.web_search = original_search
+        app._SEARCH_CACHE.clear()
+        restore(original)
+        server.shutdown()
+
+
 def main() -> int:
     print("Проверка перевода (локальный сервер-заглушка)")
     test_stream_and_json()
     test_cancel_closes_request()
+    test_analysis_flow()
     print(f"\nПровалов: {len(FAILURES)}")
     return 1 if FAILURES else 0
 

@@ -1,8 +1,9 @@
-pyAutoImgTranslate is a utility that automatically translates text from screenshots through OCR and AI.
+pyAutoImgTranslate is a utility that automatically translates text from screenshots through OCR and AI — and analyses a screenshot (describes it, looks things up on the web) on a separate hotkey.
 
 ## Main functions
 
 - Screenshot of the area: pressing the hotkey freezes the screen and shows a full-screen overlay where you drag the region — the built-in selector, just like Win+Shift+S (all monitors, `Esc` / right click cancels, the size is shown while dragging). The system capture (Windows Snipping Tool / `grim`, `scrot`, … on Linux) stays available as the `system` mode and is used automatically if the screen cannot be grabbed. Mode: `capture_mode` (`builtin` / `system`).
+- **Image analysis (`Win+Shift+I`)**: the same area selector, but the capture is **described** by the vision model, and when the frame shows something worth checking (a product, model, place, person, game, app, error, event) the app **searches the web** and answers from the found sources. The answer window has **Ответ** and **Источники** tabs, and the links are clickable. Toggle the search with `analyze_web_search`.
 - OCR with rectification: Text recognition with automatic tilt correction (deskew) using Tesseract and OpenCV, with garbage-line cleanup (`eng+rus`).
 - OCR/translation: By default the **neural network reads the image directly** (vision) and returns a faithful translation — no Tesseract needed. A local **Tesseract** mode is also available. Toggle with `ocr_mode` (`ai` / `tesseract`).
 - No-text guard: before any API request the capture is checked locally. A cheap structural test rejects empty captures instantly (solid fills, gradients, noise, plain photos); anything that looks like a text line is then confirmed by a quick local OCR pass (Tesseract, LSTM, downscaled to 1100 px). If the OCR is unavailable the capture is processed anyway, so a translation is never lost — and for text on a very busy background the option can be switched off. Toggle with `skip_no_text`.
@@ -114,7 +115,28 @@ The settings window lets you:
 - **Открыть config.json** — saves and opens the config file for manual editing.
 
 Check boxes in the settings window control `add_to_autostart`, `keep_image_on_top`,
-`live_on_top`, `skip_no_text` and `stream_results`.
+`live_on_top`, `skip_no_text`, `stream_results` and `analyze_web_search`.
+
+### Analysis (description + web search)
+
+The analysis hotkey runs two model calls and a search in between:
+
+1. the vision model describes the capture and, when it makes sense, appends a
+   `ПОИСК:` block with 1–3 short search queries (or `ПОИСК: НЕТ`);
+2. the queries are searched **in parallel** (Wikipedia articles and extracts first,
+   then Bing RSS), every hit is checked against the query, and decoy/unrelated
+   results are dropped;
+3. the model receives the description plus the sources and writes the answer with
+   `[1]`, `[2]` references.
+
+Results are cached for 10 minutes, and the search bypasses a dead proxy
+automatically (it tries a direct connection first, then the proxy from the
+environment). If nothing relevant is found, the model answers from its own
+knowledge and says so instead of inventing facts.
+
+> Privacy: the generated search queries leave the machine (Wikipedia/Bing) — the
+> screenshot itself never does. Disable `analyze_web_search` to keep the analysis
+> fully local apart from the model request.
 
 ### Cancelling and re-shooting
 
@@ -130,9 +152,9 @@ Offline checks (no network needed, Tesseract is used locally for the no-text
 filter):
 
 ```bash
-python tests/test_offline.py          # no-text filter, stream parsing, jobs, OCR grouping
-python tests/test_gui_smoke.py        # result window / progress plate / toasts in real Tk
-python tests/test_translation_flow.py # streaming + cancellation against a local stub server
+python tests/test_offline.py          # no-text filter, stream/analysis parsing, search layer, jobs
+python tests/test_gui_smoke.py        # result window (translation + analysis), selector, settings
+python tests/test_translation_flow.py # streaming, cancellation and analysis against a stub server
 ```
 
 All windows run inside a single dedicated Tk thread, so opening settings from the tray
@@ -162,6 +184,10 @@ or the result window is safe (no second `Tk()` root).
 | `add_to_autostart` | Launch with Windows | `false` |
 | `keep_image_on_top` | Result window always on top | `false` |
 | `hotkey` | Global hotkey: capture area → OCR → translate (in `builtin` mode `Win+Shift+S` is replaced by `Win+Shift+X`) | `windows+shift+s` |
+| `analyze_hotkey` | Global hotkey: capture area → describe + web search | `windows+shift+i` |
+| `analyze_web_search` | Search the web during analysis | `true` |
+| `search_results` | Results per search query | `4` |
+| `search_timeout` | Timeout of one search request, seconds | `8` |
 | `live_hotkey` | Toggle live mode | `windows+shift+a` |
 
 Each entry in `providers[]` looks like:
