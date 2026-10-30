@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Хуки и shell-скрипты должны быть с LF, иначе они не запускаются на Linux
+.githooks/* text eol=lf
+*.sh text eol=lf

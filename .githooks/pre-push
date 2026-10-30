@@ -1,0 +1,25 @@
+#!/bin/sh
+# Не даёт запушить ключи, журналы, скриншоты и локальные настройки.
+# Включается один раз на клон:
+#     git config core.hooksPath .githooks
+set -e
+
+PY=""
+for candidate in ".venv/Scripts/python.exe" ".venv/bin/python" "python" "python3" "py"; do
+    if [ -x "$candidate" ] || command -v "$candidate" >/dev/null 2>&1; then
+        PY="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PY" ]; then
+    echo "pre-push: Python не найден — проверка чувствительных данных пропущена." >&2
+    exit 0
+fi
+
+if ! "$PY" tools/check_sensitive.py; then
+    echo "" >&2
+    echo "Пуш остановлен: в репозитории есть чувствительные данные." >&2
+    echo "Уберите их или перепишите историю, затем повторите пуш." >&2
+    exit 1
+fi

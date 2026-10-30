@@ -48,7 +48,7 @@ import requests
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageGrab, ImageTk
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")

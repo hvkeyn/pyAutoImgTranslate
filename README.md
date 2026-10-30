@@ -77,7 +77,7 @@ sudo apt-get install -y python3 python3-pip python3-venv python3-tk \
 ```bash
 # Linux
 ./build.sh            # -> dist/pyAutoImgTranslate
-./build_deb.sh 1.7.0  # -> dist/pyautoimgtranslate_1.7.0_<arch>.deb
+./build_deb.sh 1.8.1  # -> dist/pyautoimgtranslate_1.8.1_<arch>.deb
 
 # Windows
 build.bat             # -> dist\pyAutoImgTranslate.exe
@@ -86,7 +86,7 @@ build.bat             # -> dist\pyAutoImgTranslate.exe
 ### Install the .deb (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./pyautoimgtranslate_1.7.0_amd64.deb
+sudo apt install ./pyautoimgtranslate_1.8.1_amd64.deb
 # then run:  pyautoimgtranslate   (or launch from the applications menu)
 ```
 
@@ -94,6 +94,27 @@ The `.deb` installs the binary to `/usr/lib/pyautoimgtranslate/`, a launcher to
 `/usr/bin/pyautoimgtranslate`, plus a desktop entry and icon. Dependencies
 (`python3-tk`, `libgl1`, `libglib2.0-0`) are pulled in automatically; Tesseract,
 `xclip` and a screenshot tool are recommended.
+
+## Release checklist
+
+1. `python tools/check_sensitive.py` — no API keys, tokens, logs, screenshots,
+   local settings or build artifacts in the tree **or in the git history**.
+   Secret values are printed masked, never in full.
+2. `python tests/test_offline.py && python tests/test_gui_smoke.py && python tests/test_translation_flow.py`
+3. Bump `APP_VERSION` in `main.py`, the default version in `build_deb.sh`, and add a
+   `RELEASE_NOTES.md` section.
+4. Build the executable (`build.bat`) and, on Linux, the `.deb` (`./build_deb.sh X.Y.Z`).
+5. `git add -A && git commit && git tag -a vX.Y.Z -m "pyAutoImgTranslate X.Y.Z" && git push origin main --follow-tags`
+
+The guard can run automatically before every push — enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+**Never commit**: `config.json` (may hold the API key), `*.log` (may hold text from
+the screen), screenshots (`debug_*.png`), `build/` and `dist/`. All of these are in
+`.gitignore`; the checker verifies it.
 
 ## Configuration
 
