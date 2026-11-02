@@ -1,4 +1,4 @@
-﻿"""
+"""
 pyAutoImgTranslate — перевод текста с экрана.
 
 Возможности:
@@ -34,6 +34,7 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ElementTree
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from html import unescape as unescape_html
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -46,9 +47,9 @@ import numpy as np
 import pytesseract
 import requests
 
-from PIL import Image, ImageDraw, ImageEnhance, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageGrab, ImageTk
 
-APP_VERSION = "1.8.2"
+APP_VERSION = "1.9.0"
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
@@ -183,6 +184,10 @@ DEFAULT_CONFIG = {
     "analyze_web_search": True,     # при анализе снимка искать информацию в интернете
     "search_results": 4,            # сколько результатов брать с одного поискового запроса
     "search_timeout": 8,            # таймаут одного поискового запроса, секунды
+    # Перевод поверх экрана: период обновления и область (null — весь экран).
+    "overlay_interval": 3.0,
+    "overlay_area": None,
+    "overlay_hotkey": "windows+shift+t" if IS_WINDOWS else "ctrl+alt+t",
     "hotkey": _default_hotkey(),
     "live_hotkey": _default_live_hotkey(),
     "analyze_hotkey": _default_analyze_hotkey(),
@@ -497,6 +502,20 @@ def effective_analyze_hotkey() -> str:
         fallback = _default_analyze_hotkey()
         if fallback.lower() != effective_hotkey().lower():
             logger.warning("Клавиша анализа совпала с клавишей перевода — беру %s.", fallback)
+            return fallback
+    return hotkey
+
+
+def effective_overlay_hotkey() -> str:
+    """Действующая клавиша перевода поверх экрана (не совпадает с остальными)."""
+    hotkey = (CONFIG.get("overlay_hotkey") or
+              ("windows+shift+t" if IS_WINDOWS else "ctrl+alt+t")).strip()
+    taken = {effective_hotkey().lower(), effective_analyze_hotkey().lower(),
+             str(CONFIG.get("live_hotkey") or "").lower()}
+    if hotkey.lower() in SYSTEM_CAPTURE_HOTKEYS or hotkey.lower() in taken:
+        fallback = "windows+shift+t" if IS_WINDOWS else "ctrl+alt+t"
+        if fallback.lower() not in taken:
+            logger.warning("Клавиша оверлея занята — беру %s.", fallback)
             return fallback
     return hotkey
 
@@ -2336,6 +2355,554 @@ def process_analysis(image: Image.Image, job: "Job | None" = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Перевод поверх экрана (оверлей): плашки с переводом прямо на месте текста.
+#
+# Идея и механизм — как в русификаторах игр поверх экрана: снимок области →
+# OCR со координатами строк → перевод → прозрачное окно поверх всех, в котором
+# поверх исходного текста нарисованы плашки с переводом. Окно не перехватывает
+# мышь и исключено из снимков экрана (WDA_EXCLUDEFROMCAPTURE), иначе система
+# распознавала бы собственный перевод. Реализация собственная: исходный проект
+# (github.com/sgfsd/game-russificator) распространяется под GPLv3, его код здесь
+# не используется — только идея и общая схема.
+# ---------------------------------------------------------------------------
+OVERLAY_KEY_COLOR = "#FE00FE"       # цвет-ключ прозрачности (в кадре не встречается)
+OVERLAY_PLATE_BG = "#14161B"
+OVERLAY_PLATE_BORDER = "#8B7BFF"
+OVERLAY_TEXT_COLOR = "#F5F6FA"
+OVERLAY_MIN_FONT_PX = 11
+OVERLAY_MAX_FONT_PX = 40
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+
+class TextBlock:
+    """Строка (абзац) текста на снимке: рамка, текст и высота строки."""
+
+    __slots__ = ("rect", "text", "line_h", "confidence")
+
+    def __init__(self, rect: tuple[int, int, int, int], text: str,
+                 line_h: float, confidence: float) -> None:
+        self.rect = rect
+        self.text = text
+        self.line_h = line_h
+        self.confidence = confidence
+
+    def __repr__(self) -> str:
+        return (f"TextBlock({self.rect}, {self.text[:24]!r}, "
+                f"line_h={self.line_h:.0f}, conf={self.confidence:.0f})")
+
+
+def ocr_text_blocks(image: Image.Image, *, max_side: int = 2200,
+                    min_confidence: float = 45.0, min_chars: int = 3,
+                    psm: str = "--psm 11 --oem 1") -> list[TextBlock]:
+    """Распознаёт текст и возвращает блоки с координатами (для оверлея).
+
+    Работает на уменьшенной копии (скорость важнее), координаты пересчитываются
+    обратно в пиксели исходного снимка.
+    """
+    _configure_tesseract()
+    width, height = image.size
+    if max(width, height) > max_side:
+        scale = max_side / max(width, height)
+        prepared = image.resize((max(1, int(width * scale)), max(1, int(height * scale))),
+                                Image.Resampling.LANCZOS)
+    else:
+        scale = 1.0
+        prepared = image
+    try:
+        data = pytesseract.image_to_data(
+            prepared, lang=CONFIG.get("ocr_lang", "eng+rus"), config=psm,
+            output_type=pytesseract.Output.DICT)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Оверлей: OCR не удался: %s", exc)
+        return []
+
+    total = len(data.get("text") or [])
+    lines: dict[tuple[int, int, int], list[tuple[int, int, int, int, str, float]]] = {}
+    for index in range(total):
+        word = (data["text"][index] or "").strip()
+        if not word:
+            continue
+        try:
+            confidence = float(data["conf"][index])
+        except (TypeError, ValueError):
+            confidence = -1.0
+        if confidence < min_confidence:
+            continue
+        box = (int(data["left"][index]), int(data["top"][index]),
+               int(data["width"][index]), int(data["height"][index]))
+        if box[2] < 2 or box[3] < 6:
+            continue
+        key = (int(data["block_num"][index]), int(data["par_num"][index]),
+               int(data["line_num"][index]))
+        lines.setdefault(key, []).append((*box, word, confidence))
+
+    # Строки → абзацы того же блока/параграфа.
+    paragraphs: dict[tuple[int, int], list[tuple[tuple[int, int, int, int], str, float, float]]] = {}
+    for (block_num, par_num, _line_num), words in lines.items():
+        words.sort(key=lambda item: item[0])
+        left = min(item[0] for item in words)
+        top = min(item[1] for item in words)
+        right = max(item[0] + item[2] for item in words)
+        bottom = max(item[1] + item[3] for item in words)
+        heights = sorted(item[3] for item in words)
+        line_h = float(heights[len(heights) // 2])
+        text = " ".join(item[4] for item in words)
+        confidence = sum(item[5] for item in words) / len(words)
+        paragraphs.setdefault((block_num, par_num), []).append(
+            ((left, top, right - left, bottom - top), text, line_h, confidence))
+
+    blocks: list[TextBlock] = []
+    for items in paragraphs.values():
+        items.sort(key=lambda item: item[0][1])
+        left = min(item[0][0] for item in items)
+        top = min(item[0][1] for item in items)
+        right = max(item[0][0] + item[0][2] for item in items)
+        bottom = max(item[0][1] + item[0][3] for item in items)
+        line_heights = sorted(item[2] for item in items)
+        line_h = float(line_heights[len(line_heights) // 2])
+        text = "\n".join(item[1] for item in items)
+        confidence = sum(item[3] for item in items) / len(items)
+        if len(text.replace("\n", " ")) < min_chars:
+            continue
+        if scale != 1.0:
+            left, top = int(left / scale), int(top / scale)
+            right, bottom = int(right / scale), int(bottom / scale)
+            line_h = line_h / scale
+        rect = (max(0, left), max(0, top),
+                min(width, right) - max(0, left), min(height, bottom) - max(0, top))
+        if rect[2] < 3 or rect[3] < 6:
+            continue
+        blocks.append(TextBlock(rect, text, line_h, confidence))
+    blocks.sort(key=lambda block: (block.rect[1], block.rect[0]))
+    return blocks
+
+
+def looks_russian(text: str) -> bool:
+    """Текст уже на русском — переводить не нужно (и это защита от своих плашек)."""
+    cyrillic = sum(1 for char in text if "\u0400" <= char <= "\u04FF")
+    latin = sum(1 for char in text if char.isascii() and char.isalpha())
+    letters = cyrillic + latin
+    return letters >= 3 and cyrillic / letters >= 0.6
+
+
+def should_translate_block(text: str) -> bool:
+    """Есть ли в блоке что переводить (буквы, а не только цифры и знаки)."""
+    cleaned = (text or "").strip()
+    if len(cleaned) < 3:
+        return False
+    letters = sum(1 for char in cleaned if char.isalpha())
+    if letters < 2:
+        return False
+    return not looks_russian(cleaned)
+
+
+def _build_blocks_messages(texts: list[str]) -> list[dict]:
+    target = CONFIG.get("target_lang", "русский") or "русский"
+    numbered = "\n".join(f"{index}. {text.replace(chr(10), ' ')}"
+                         for index, text in enumerate(texts, 1))
+    system = (
+        f"Ты переводчик игровых интерфейсов. Переведи каждый пронумерованный фрагмент "
+        f"на {target} язык точно и коротко, как в интерфейсе.\n"
+        "Верни ровно столько же строк, каждая вида «номер. перевод», в том же порядке.\n"
+        "Не добавляй пояснений, не объединяй и не разбивай фрагменты. "
+        "Имена, числа, единицы и коды оставляй как есть."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": numbered}]
+
+
+NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)\s*[.)]\s*(.*)$")
+
+
+def parse_numbered_translations(text: str, count: int) -> list[str | None]:
+    """Разбирает ответ «1. … 2. …» в список переводов по номерам."""
+    results: list[str | None] = [None] * count
+    current: int | None = None
+    for line in (text or "").splitlines():
+        match = NUMBERED_LINE_RE.match(line)
+        if match:
+            index = int(match.group(1)) - 1
+            if 0 <= index < count:
+                results[index] = match.group(2).strip()
+                current = index
+            else:
+                current = None      # лишний номер — строку и её продолжение игнорируем
+            continue
+        if current is not None and line.strip():
+            merged = f"{results[current] or ''} {line.strip()}".strip()
+            results[current] = merged
+    return results
+
+
+def translate_blocks(texts: list[str], job=None) -> list[str | None]:
+    """Переводит пачку блоков одним запросом, сохраняя порядок."""
+    if not texts:
+        return []
+    answer = _chat_completion(_build_blocks_messages(texts),
+                              label=f"Оверлей: перевод {len(texts)} блоков", job=job)
+    parsed = parse_numbered_translations(answer, len(texts))
+    found = sum(1 for item in parsed if item)
+    logger.info("Оверлей: переведено блоков %d из %d.", found, len(texts))
+    return parsed
+
+
+@lru_cache(maxsize=64)
+def _overlay_font(px: int):
+    """Шрифт для измерения текста (PIL — можно из фонового потока)."""
+    for path in (r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf"):
+        if Path(path).is_file():
+            try:
+                return ImageFont.truetype(path, px)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _wrap_lines(text: str, font, max_width: float) -> list[str]:
+    """Переносит текст по словам под ширину в пикселях."""
+    lines: list[str] = []
+    for paragraph in (text or "").split("\n"):
+        words = paragraph.split()
+        if not words:
+            continue
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if font.getlength(candidate) <= max_width or not current:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+    return lines or [""]
+
+
+def build_overlay_layouts(blocks: list[TextBlock], translations: list[str | None],
+                          canvas_size: tuple[int, int]) -> list[tuple[tuple[int, int, int, int],
+                                                                      list[str], int]]:
+    """Считает плашки и строки перевода: (рамка, строки, размер шрифта).
+
+    Размер шрифта подбирается под место: начинаем от высоты исходной строки и
+    уменьшаем, пока перевод (он длиннее оригинала) не поместится в рамку.
+    """
+    canvas_w, canvas_h = canvas_size
+    layouts = []
+    for block, translation in zip(blocks, translations):
+        if not translation:
+            continue
+        line_h = max(8.0, block.line_h)
+        pad = max(3, int(line_h * 0.3))
+        x, y, w, h = block.rect
+        box_w = max(int(line_h * 4), int(w + pad * 2))
+        box_w = min(box_w, max(40, canvas_w - 2))
+        box_x = max(0, min(int(x - pad), canvas_w - box_w))
+        size = max(OVERLAY_MIN_FONT_PX, min(OVERLAY_MAX_FONT_PX, int(line_h * 0.8)))
+        limit_h = max(h, line_h) * 1.5 + pad * 2
+        while True:
+            font = _overlay_font(size)
+            lines = _wrap_lines(translation, font, box_w - pad * 2)
+            text_h = len(lines) * size * 1.22
+            if text_h + pad * 2 <= limit_h or size <= OVERLAY_MIN_FONT_PX:
+                break
+            size -= 1
+        box_h = int(min(canvas_h, max(text_h, h) + pad * 2))
+        box_y = max(0, min(int(y - pad), canvas_h - box_h))
+        layouts.append(((box_x, box_y, int(box_w), int(box_h)), lines, size))
+    return layouts
+
+
+class OverlayWindow:
+    """Прозрачное окно поверх всех окон: плашки с переводом на месте текста."""
+
+    def __init__(self, area: tuple[int, int, int, int]) -> None:
+        self.area = area
+        self.win: "tk.Toplevel | None" = None
+        self.canvas: "tk.Canvas | None" = None
+        self.hwnd: int = 0
+        self._excluded = False
+
+    def build(self) -> None:
+        """Создаёт окно (вызывать в UI-потоке)."""
+        x, y, width, height = self.area
+        self.destroy()
+        win = tk.Toplevel(_ui_root)
+        self.win = win
+        win.overrideredirect(True)
+        win.geometry(f"{max(1, width)}x{max(1, height)}+{x}+{y}")
+        win.configure(bg=OVERLAY_KEY_COLOR)
+        try:
+            win.attributes("-topmost", True)
+            win.attributes("-transparentcolor", OVERLAY_KEY_COLOR)
+        except tk.TclError as exc:
+            logger.warning("Оверлей: прозрачность окна недоступна: %s", exc)
+        canvas = tk.Canvas(win, bg=OVERLAY_KEY_COLOR, highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+        self.canvas = canvas
+        win.update_idletasks()
+        self._make_click_through()
+
+    def _make_click_through(self) -> None:
+        """Окно не перехватывает мышь и не попадает в снимки экрана."""
+        if not IS_WINDOWS or self.win is None:
+            return
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.GetWindowLongW.restype = ctypes.c_long
+            user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+            user32.SetWindowLongW.restype = ctypes.c_long
+            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_uint]
+            user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+            user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+
+            hwnd = int(self.win.winfo_id())
+            parent = int(user32.GetParent(hwnd) or 0)
+            self.hwnd = parent or hwnd
+            gwl_exstyle = -20
+            ws_ex_layered, ws_ex_transparent = 0x00080000, 0x00000020
+            ws_ex_toolwindow, ws_ex_noactivate = 0x00000080, 0x08000000
+            style = user32.GetWindowLongW(self.hwnd, gwl_exstyle)
+            user32.SetWindowLongW(
+                self.hwnd, gwl_exstyle,
+                style | ws_ex_layered | ws_ex_transparent | ws_ex_toolwindow | ws_ex_noactivate)
+            hwnd_topmost = -1
+            swp_nomove, swp_nosize, swp_noactivate = 0x0002, 0x0001, 0x0010
+            user32.SetWindowPos(self.hwnd, hwnd_topmost, 0, 0, 0, 0,
+                                swp_nomove | swp_nosize | swp_noactivate)
+            self._excluded = bool(user32.SetWindowDisplayAffinity(
+                self.hwnd, WDA_EXCLUDEFROMCAPTURE))
+            if not self._excluded:
+                logger.warning("Оверлей: не удалось исключить окно из снимков экрана — "
+                               "собственные плашки могут распознаваться повторно.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Оверлей: не удалось настроить окно: %s", exc)
+
+    def draw(self, layouts: list[tuple[tuple[int, int, int, int], list[str], int]]) -> None:
+        """Рисует плашки (вызывать в UI-потоке)."""
+        if self.canvas is None:
+            return
+        try:
+            self.canvas.delete("all")
+            for (x, y, width, height), lines, size in layouts:
+                pad = max(3, int(size * 0.3))
+                self.canvas.create_rectangle(x, y, x + width, y + height,
+                                             fill=OVERLAY_PLATE_BG,
+                                             outline=OVERLAY_PLATE_BORDER)
+                text_y = y + pad
+                for line in lines:
+                    self.canvas.create_text(x + pad, text_y, text=line, anchor="nw",
+                                            fill=OVERLAY_TEXT_COLOR,
+                                            font=("Segoe UI", -size))
+                    text_y += int(size * 1.22)
+        except tk.TclError:
+            pass
+
+    def clear(self) -> None:
+        if self.canvas is not None:
+            try:
+                self.canvas.delete("all")
+            except tk.TclError:
+                pass
+
+    def destroy(self) -> None:
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+        self.win = None
+        self.canvas = None
+        self.hwnd = 0
+
+
+class _OverlayCancel:
+    """Отмена для запросов оверлея (совместима с Job, но не мешает обычным задачам)."""
+
+    __slots__ = ("cancel", "gen")
+
+    def __init__(self, event: threading.Event) -> None:
+        self.cancel = event
+        self.gen = 0
+
+    def cancelled(self) -> bool:
+        return self.cancel.is_set()
+
+    def check(self) -> None:
+        if self.cancel.is_set():
+            raise Cancelled()
+
+
+class OverlayController:
+    """Включение/выключение перевода поверх экрана и цикл обновления."""
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+        self._window: "OverlayWindow | None" = None
+        self._lock = threading.Lock()
+        self._last_digest = ""
+
+    # --- состояние --------------------------------------------------------
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def area(self) -> tuple[int, int, int, int]:
+        saved = CONFIG.get("overlay_area")
+        if isinstance(saved, (list, tuple)) and len(saved) == 4:
+            try:
+                x, y, w, h = (int(value) for value in saved)
+                if w > 20 and h > 20:
+                    return x, y, w, h
+            except (TypeError, ValueError):
+                pass
+        return _virtual_screen_bounds()
+
+    # --- управление -------------------------------------------------------
+    def toggle(self) -> bool:
+        if self._enabled:
+            self.stop("горячая клавиша")
+            return False
+        return self.start()
+
+    def start(self) -> bool:
+        if not IS_WINDOWS:
+            _toast("Перевод поверх экрана доступен только в Windows", kind="warn", seconds=5.0)
+            return False
+        if self._enabled:
+            return True
+        area = self.area()
+        if area[2] < 20 or area[3] < 20:
+            logger.warning("Оверлей: некорректная область %s", area)
+            return False
+        with self._lock:
+            self._enabled = True
+            self._stop.clear()
+            self._last_digest = ""
+            self._window = OverlayWindow(area)
+            window = self._window
+        run_on_ui(window.build)
+        self._thread = threading.Thread(target=self._loop, args=(window,),
+                                        name="overlay", daemon=True)
+        self._thread.start()
+        logger.info("Оверлей включён: область %s, обновление каждые %.1f с.",
+                    area, float(CONFIG.get("overlay_interval") or 3))
+        _toast("Перевод поверх экрана: ВКЛ", kind="success")
+        return True
+
+    def stop(self, reason: str = "") -> None:
+        with self._lock:
+            if not self._enabled:
+                return
+            self._enabled = False
+            self._stop.set()
+            window = self._window
+            self._window = None
+        if window is not None:
+            run_on_ui(window.destroy)
+        logger.info("Оверлей выключен%s.", f" ({reason})" if reason else "")
+        _toast("Перевод поверх экрана: ВЫКЛ", kind="info")
+
+    def refresh_area(self) -> None:
+        """Пересоздаёт окно под новую область (если режим включён)."""
+        with self._lock:
+            enabled = self._enabled
+        if not enabled:
+            return
+        self.stop("смена области")
+        self.start()
+
+    # --- цикл -------------------------------------------------------------
+    def _loop(self, window: OverlayWindow) -> None:
+        cancel = _OverlayCancel(self._stop)
+        interval = max(0.7, float(CONFIG.get("overlay_interval") or 3))
+        first = True
+        while not self._stop.is_set():
+            started = time.time()
+            try:
+                area = window.area
+                shot = ImageGrab.grab(bbox=(area[0], area[1], area[0] + area[2],
+                                            area[1] + area[3]), all_screens=True)
+                if shot is None:
+                    self._stop.wait(interval)
+                    continue
+                shot = shot.convert("RGB")
+                blocks = ocr_text_blocks(shot)
+                pending = [block for block in blocks if should_translate_block(block.text)]
+                digest = hashlib.sha1(
+                    "\n".join(f"{b.rect}:{b.text}" for b in pending).encode("utf-8")
+                ).hexdigest() if pending else ""
+                if digest != self._last_digest:
+                    self._last_digest = digest
+                    translations: list[str | None] = []
+                    if pending:
+                        texts = [block.text for block in pending]
+                        translations = translate_blocks(texts, job=cancel)
+                    layouts = build_overlay_layouts(pending, translations, shot.size)
+                    logger.info("Оверлей: блоков %d, плашек %d.", len(pending), len(layouts))
+                    run_on_ui(lambda layouts=layouts: window.draw(layouts))
+                elif first:
+                    run_on_ui(window.clear)
+                first = False
+            except Cancelled:
+                break
+            except Exception as exc:  # noqa: BLE001
+                if self._stop.is_set():
+                    break
+                logger.warning("Оверлей: ошибка обновления: %s", exc)
+            elapsed = time.time() - started
+            self._stop.wait(max(interval - elapsed, 0.4))
+        logger.info("Оверлей: цикл завершён.")
+
+
+OVERLAY = OverlayController()
+
+
+def is_overlay_enabled() -> bool:
+    return OVERLAY.enabled()
+
+
+def toggle_overlay() -> None:
+    OVERLAY.toggle()
+    _refresh_tray_menu()
+
+
+def overlay_choose_area() -> None:
+    """Выбор области для оверлея своим селектором (в фоне)."""
+    def worker() -> None:
+        job = _new_job("hotkey", "overlay")
+        try:
+            image, reason, rect = select_region_with_rect(job)
+            if image is None or rect is None:
+                return
+            CONFIG["overlay_area"] = list(rect)
+            save_config(CONFIG)
+            logger.info("Оверлей: область сохранена %s.", rect)
+            _toast(f"Область оверлея: {rect[2]}×{rect[3]}", kind="success")
+            if OVERLAY.enabled():
+                OVERLAY.refresh_area()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Оверлей: не удалось выбрать область: %s", exc)
+        finally:
+            _finish_job(job)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def overlay_reset_area() -> None:
+    """Сброс области оверлея на весь экран."""
+    CONFIG["overlay_area"] = None
+    save_config(CONFIG)
+    _toast("Область оверлея: весь экран", kind="info")
+    if OVERLAY.enabled():
+        OVERLAY.refresh_area()
+
+
+# ---------------------------------------------------------------------------
 # Дизайн-система (токены)
 #
 # Мини-дизайн-система для tkinter: единые цветовые роли, шкала отступов
@@ -3424,6 +3991,18 @@ def open_settings_window(parent: tk.Misc | None = None) -> None:
             fg=Color.TEXT_ON_DARK_MUTED, font=Font.CAPTION)
         analyze_hint.grid(row=6, column=2, columnspan=2, sticky="w", pady=(Space.XS, 0))
 
+        # Перевод поверх экрана: подсказка о клавише и области.
+        overlay_row = tk.Frame(common, bg=Color.SURFACE)
+        overlay_row.grid(row=7, column=0, columnspan=4, sticky="w", pady=(Space.XS, 0))
+        overlay_area = CONFIG.get("overlay_area")
+        area_text = (f"{overlay_area[2]}×{overlay_area[3]}" if overlay_area else "весь экран")
+        tk.Label(overlay_row, text="Перевод поверх экрана:", **label_opts).pack(side="left")
+        tk.Label(overlay_row,
+                 text=f"{effective_overlay_hotkey()} · обновление "
+                      f"{float(CONFIG.get('overlay_interval') or 3):.0f} с · область: {area_text}",
+                 bg=Color.SURFACE, fg=Color.TEXT_ON_DARK_MUTED, font=Font.CAPTION
+                 ).pack(side="left", padx=(Space.SM, 0))
+
         status = tk.Label(win, text="", bg=Color.SURFACE, fg=Color.ACCENT, anchor="w",
                           justify="left", wraplength=600, font=Font.CAPTION)
         status.pack(fill="x", padx=Space.MD)
@@ -3930,6 +4509,7 @@ class RegionOverlay:
         self.shot = shot
         self.bounds = bounds
         self.result: "Image.Image | None" = None
+        self.result_rect: "tuple[int, int, int, int] | None" = None
         self.cancelled = False
         self.done = threading.Event()
         self.win: "tk.Toplevel | None" = None
@@ -4144,6 +4724,8 @@ class RegionOverlay:
         except Exception as exc:  # noqa: BLE001
             logger.error("Не удалось вырезать область: %s", exc)
             self.result = None
+        origin_x, origin_y = self.bounds[0], self.bounds[1]
+        self.result_rect = (origin_x + left, origin_y + top, right - left, bottom - top)
         logger.info("Выделена область %dx%d (экран %dx%d).",
                     ix1 - ix0, iy1 - iy0, self.shot.width, self.shot.height)
         self.close_window()
@@ -4159,16 +4741,15 @@ class RegionOverlay:
         self.finish(event.x, event.y)
 
 
-def select_region_interactive(job: "Job | None" = None) -> tuple["Image.Image | None", str]:
-    """Показывает оверлей выделения и ждёт результат (можно вызывать из потока).
+def select_region_with_rect(job: "Job | None" = None
+                            ) -> tuple["Image.Image | None", str, "tuple[int, int, int, int] | None"]:
+    """Как select_region_interactive, но возвращает ещё и рамку области на экране.
 
-    Возвращает (снимок, причина). Причина: "ok" — область выделена,
-    "cancelled" — выделение отменили, "timeout" — не успели,
-    "unsupported" — снять экран не удалось (нужен системный захват).
+    Рамка нужна оверлею: по ней он ставит своё окно поверх того же места.
     """
     shot = grab_virtual_screen()
     if shot is None:
-        return None, "unsupported"
+        return None, "unsupported", None
     bounds = _virtual_screen_bounds()
     # Снимок и границы мониторов должны совпадать; если система отдала другую
     # геометрию — подстраиваем границы под картинку.
@@ -4184,10 +4765,21 @@ def select_region_interactive(job: "Job | None" = None) -> tuple["Image.Image | 
         logger.info("Выделение области не завершено за %.0f с — отменяю.", timeout)
         run_on_ui(lambda: overlay.cancel("истекло время"))
         overlay.done.wait(3.0)
-        return None, "timeout"
+        return None, "timeout", None
     if overlay.result is None:
-        return None, "cancelled"
-    return overlay.result, "ok"
+        return None, "cancelled", None
+    return overlay.result, "ok", overlay.result_rect
+
+
+def select_region_interactive(job: "Job | None" = None) -> tuple["Image.Image | None", str]:
+    """Показывает оверлей выделения и ждёт результат (можно вызывать из потока).
+
+    Возвращает (снимок, причина). Причина: "ok" — область выделена,
+    "cancelled" — выделение отменили, "timeout" — не успели,
+    "unsupported" — снять экран не удалось (нужен системный захват).
+    """
+    image, reason, _rect = select_region_with_rect(job)
+    return image, reason
 
 
 def on_hotkey() -> None:
@@ -4466,13 +5058,39 @@ def on_capture_analyze(icon, _item) -> None:
     threading.Thread(target=on_hotkey_analyze, daemon=True).start()
 
 
+def on_toggle_overlay(icon, _item) -> None:
+    """Пункт меню: перевод поверх экрана (вкл/выкл)."""
+    OVERLAY.toggle()
+    _refresh_menu(icon)
+
+
+def on_overlay_area(icon, _item) -> None:
+    """Пункт меню: выбрать область для перевода поверх экрана."""
+    overlay_choose_area()
+    _refresh_menu(icon)
+
+
+def on_overlay_reset_area(icon, _item) -> None:
+    """Пункт меню: оверлей на весь экран."""
+    overlay_reset_area()
+    _refresh_menu(icon)
+
+
 def _build_menu():
     from pystray import Menu, MenuItem
 
+    overlay_area = CONFIG.get("overlay_area")
+    area_text = "весь экран" if not overlay_area else f"{overlay_area[2]}×{overlay_area[3]}"
     return Menu(
         MenuItem(f"pyAutoImgTranslate {APP_VERSION}", on_settings),
         MenuItem(f"Перевод области — {effective_hotkey()}", on_capture_translate),
         MenuItem(f"Анализ области — {effective_analyze_hotkey()}", on_capture_analyze),
+        Menu.SEPARATOR,
+        MenuItem(f"Перевод поверх экрана — {effective_overlay_hotkey()}",
+                 on_toggle_overlay, checked=lambda _i: is_overlay_enabled()),
+        MenuItem(f"Область оверлея: {area_text} — выбрать…", on_overlay_area),
+        MenuItem("Оверлей: на весь экран", on_overlay_reset_area,
+                 enabled=lambda _i: bool(CONFIG.get("overlay_area"))),
         Menu.SEPARATOR,
         MenuItem("Режим «на лету»", on_toggle_live, checked=lambda _i: is_live_mode()),
         MenuItem("Отменить обработку", on_cancel_job,
@@ -4489,12 +5107,32 @@ def _build_menu():
     )
 
 
+# Ссылка на иконку трея: нужна, чтобы обновлять меню из горячих клавиш.
+_tray_icon = None
+
+
+def _refresh_tray_menu() -> None:
+    """Перерисовывает меню трея, если иконка уже создана."""
+    icon = _tray_icon
+    if icon is None:
+        return
+    try:
+        icon.update_menu()
+    except Exception:  # noqa: BLE001
+        try:
+            icon.menu = _build_menu()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Не удалось обновить меню трея: %s", exc)
+
+
 def start_tray_icon() -> None:
     from pystray import Icon
 
+    global _tray_icon
     # title/name должны быть ASCII-frendly: X11 кодирует имя окна в latin-1.
     icon = Icon("pyAutoImgTranslate", create_image_for_tray(),
                 f"pyAutoImgTranslate {APP_VERSION}", _build_menu())
+    _tray_icon = icon
     icon.run()
 
 
@@ -4620,9 +5258,11 @@ def main() -> None:
 
     hotkey = effective_hotkey()
     analyze_hotkey = effective_analyze_hotkey()
+    overlay_hotkey = effective_overlay_hotkey()
     live_hotkey = CONFIG.get("live_hotkey", _default_live_hotkey())
-    logger.info("Режим выделения области: %s, клавиша перевода: %s, анализа: %s.",
-                capture_mode(), hotkey, analyze_hotkey)
+    logger.info("Режим выделения области: %s, клавиша перевода: %s, анализа: %s, "
+                "перевода поверх экрана: %s.",
+                capture_mode(), hotkey, analyze_hotkey, overlay_hotkey)
     if hotkey != (CONFIG.get("hotkey") or _default_hotkey()):
         logger.info("Клавиша из настроек (%s) занята системным скриншотом — "
                     "использую %s.", CONFIG.get("hotkey"), hotkey)
@@ -4638,6 +5278,12 @@ def main() -> None:
                 logger.info("Горячая клавиша анализа %s зарегистрирована.", analyze_hotkey)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Не удалось зарегистрировать %s: %s", analyze_hotkey, exc)
+            try:
+                keyboard.add_hotkey(overlay_hotkey, toggle_overlay)
+                logger.info("Горячая клавиша перевода поверх экрана %s зарегистрирована.",
+                            overlay_hotkey)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Не удалось зарегистрировать %s: %s", overlay_hotkey, exc)
             try:
                 keyboard.add_hotkey(live_hotkey, _toggle_live_from_hotkey)
                 logger.info("Горячая клавиша режима «на лету» %s зарегистрирована.", live_hotkey)

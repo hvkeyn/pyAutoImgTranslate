@@ -226,6 +226,68 @@ def test_overlay_speed() -> None:
             app.run_on_ui(overlay.close_window)
 
 
+def test_overlay_window() -> None:
+    """Окно перевода поверх экрана: прозрачность, сквозные клики, отрисовка."""
+    window = app.OverlayWindow((0, 0, 600, 400))
+    try:
+        app.run_on_ui(window.build)
+        check("оверлей: окно создано", wait_for(lambda: window.win is not None))
+        transparent = str(window.win.attributes("-transparentcolor")).upper()
+        check("оверлей: прозрачность по ключевому цвету",
+              app.OVERLAY_KEY_COLOR.upper() in transparent, transparent)
+        check("оверлей: окно исключено из снимков экрана", window._excluded)
+        import ctypes
+
+        style = ctypes.windll.user32.GetWindowLongW(window.hwnd, -20)
+        check("оверлей: клики проходят сквозь окно", bool(style & 0x20), hex(style))
+        check("оверлей: окно не в панели задач", bool(style & 0x80), hex(style))
+
+        layouts = [((10, 10, 300, 80), ["Перевод", "строки"], 16)]
+        app.run_on_ui(lambda: window.draw(layouts))
+        check("оверлей: плашки нарисованы",
+              wait_for(lambda: len(window.canvas.find_all()) >= 3))
+        app.run_on_ui(window.clear)
+        check("оверлей: очистка", wait_for(lambda: len(window.canvas.find_all()) == 0))
+    finally:
+        app.run_on_ui(window.destroy)
+    check("оверлей: окно закрыто", wait_for(lambda: window.win is None))
+
+
+def test_overlay_controller() -> None:
+    """Режим включается/выключается и рисует плашки (захват и перевод подменены)."""
+    image = Image.new("RGB", (900, 500), (24, 28, 36))
+    draw = ImageDraw.Draw(image)
+    draw.text((40, 40), "MISSION COMPLETE", fill=(240, 240, 240), font=app._overlay_font(30))
+    draw.text((40, 120), "Press SPACE to continue", fill=(220, 220, 220),
+              font=app._overlay_font(22))
+    original = {
+        "grab": app.ImageGrab.grab,
+        "translate": app.translate_blocks,
+        "area": app.CONFIG.get("overlay_area"),
+        "interval": app.CONFIG.get("overlay_interval"),
+    }
+    app.ImageGrab.grab = lambda **kwargs: image.copy()
+    app.translate_blocks = lambda texts, job=None: [f"перевод {i}"
+                                                    for i, _t in enumerate(texts, 1)]
+    app.CONFIG["overlay_area"] = [0, 0, image.width, image.height]
+    app.CONFIG["overlay_interval"] = 0.8
+    try:
+        check("оверлей: режим включился", app.OVERLAY.start())
+        check("оверлей: режим отмечен включённым", app.is_overlay_enabled())
+        check("оверлей: плашки появились на экране",
+              wait_for(lambda: (app.OVERLAY._window is not None
+                                and app.OVERLAY._window.canvas is not None
+                                and len(app.OVERLAY._window.canvas.find_all()) >= 3), 8.0))
+    finally:
+        app.OVERLAY.stop("тест")
+        app.ImageGrab.grab = original["grab"]
+        app.translate_blocks = original["translate"]
+        app.CONFIG["overlay_area"] = original["area"]
+        app.CONFIG["overlay_interval"] = original["interval"]
+    check("оверлей: режим выключился", not app.is_overlay_enabled())
+    check("оверлей: окно убрано", wait_for(lambda: app.OVERLAY._window is None))
+
+
 def widget_texts(widget) -> list[str]:
     """Собирает тексты всех потомков окна (для проверки состава настроек)."""
     texts: list[str] = []
@@ -407,6 +469,8 @@ def main() -> int:
     test_overlay_speed()
     test_analysis_window()
     test_analysis_hotkey_dispatch()
+    test_overlay_window()
+    test_overlay_controller()
     test_settings_window()
 
     print(f"\nПровалов: {len(FAILURES)}")

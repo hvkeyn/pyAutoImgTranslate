@@ -4,6 +4,7 @@ pyAutoImgTranslate is a utility that automatically translates text from screensh
 
 - Screenshot of the area: pressing the hotkey freezes the screen and shows a full-screen overlay where you drag the region — the built-in selector, just like Win+Shift+S (all monitors, `Esc` / right click cancels, the size is shown while dragging). The system capture (Windows Snipping Tool / `grim`, `scrot`, … on Linux) stays available as the `system` mode and is used automatically if the screen cannot be grabbed. Mode: `capture_mode` (`builtin` / `system`).
 - **Image analysis (`Win+Shift+I`)**: the same area selector, but the capture is **described** by the vision model, and when the frame shows something worth checking (a product, model, place, person, game, app, error, event) the app **searches the web** and answers from the found sources. The answer window has **Ответ** and **Источники** tabs, and the links are clickable. Toggle the search with `analyze_web_search`.
+- **On-screen translation (`Win+Shift+T`)**: toggles a mode that translates whatever is on screen and paints the translation **over the original text**, like a game russifier overlay. It captures the screen (or a chosen area), OCRs text with coordinates, translates in batches and draws plates on top; the overlay window is click-through, stays out of the taskbar and is **excluded from screen captures**, so the next refresh still reads the original text. Only changed text is re-translated, blocks that are already Russian are skipped, and the refresh period is `overlay_interval` seconds. Windows only.
 - OCR with rectification: Text recognition with automatic tilt correction (deskew) using Tesseract and OpenCV, with garbage-line cleanup (`eng+rus`).
 - OCR/translation: By default the **neural network reads the image directly** (vision) and returns a faithful translation — no Tesseract needed. A local **Tesseract** mode is also available. Toggle with `ocr_mode` (`ai` / `tesseract`).
 - No-text guard: before any API request the capture is checked locally, but it **only skips obviously empty captures** (solid fills, gradients, empty UI blocks, images without detail). A structural check looks for text-like lines; when it finds none but the capture has plenty of detail (text on a game or photo background), the capture is still sent — a missed translation is much worse than one extra request. Genuinely small/faint captures are double-checked with Tesseract over several image preparations (as-is, local contrast, Otsu binarization). When the image really has no text, the model answers `NO_TEXT` and no window appears. Toggle with `skip_no_text`.
@@ -20,6 +21,13 @@ pyAutoImgTranslate is a utility that automatically translates text from screensh
 - Working in the background: The application runs in the system tray; single-instance guard prevents duplicates.
 - Logging: Rotating log file `pyAutoImgTranslate.log` next to the executable. Recognized screen text is **not** written to it by default (`log_recognized_text`); the log records stages, sizes and errors, and never the API key.
 - Speed: the built-in selector opens in ~0.15 s (screen grab) with no full-screen image copied into the UI, so dragging the frame costs well under a millisecond per mouse move; captures do not accumulate memory.
+
+## Credits
+
+The on-screen overlay idea follows the approach used by
+[game-russificator](https://github.com/sgfsd/game-russificator) (GPLv3): capture →
+OCR with coordinates → translation plates over the original. That project's code is
+**not** used here — this implementation is written from scratch.
 
 ## Technologies used
 
@@ -206,6 +214,9 @@ or the result window is safe (no second `Tk()` root).
 | `keep_image_on_top` | Result window always on top | `false` |
 | `hotkey` | Global hotkey: capture area → OCR → translate (in `builtin` mode `Win+Shift+S` is replaced by `Win+Shift+X`) | `windows+shift+s` |
 | `analyze_hotkey` | Global hotkey: capture area → describe + web search | `windows+shift+i` |
+| `overlay_hotkey` | Global hotkey: toggle on-screen translation | `windows+shift+t` |
+| `overlay_interval` | Overlay refresh period, seconds | `3.0` |
+| `overlay_area` | Overlay area `[x, y, w, h]`; `null` — whole screen | `null` |
 | `analyze_web_search` | Search the web during analysis | `true` |
 | `search_results` | Results per search query | `4` |
 | `search_timeout` | Timeout of one search request, seconds | `8` |

@@ -1,4 +1,4 @@
-﻿"""Офлайн-проверки логики pyAutoImgTranslate: без сети, без GUI, без хоткеев.
+"""Офлайн-проверки логики pyAutoImgTranslate: без сети, без GUI, без хоткеев.
 
 Запуск:
     .venv\\Scripts\\python.exe tests\\test_offline.py         (Windows)
@@ -274,6 +274,100 @@ def test_ocr_confirm() -> None:
     check("OCR-порог: мусор на фото (2 слова, 40)", not verdict(2, 40.0))
     check("OCR-порог: одно слово требует 75", not verdict(1, 70.0) and verdict(1, 80.0))
     check("OCR-порог: пустой текст", not app._ocr_confirms_text(app.OcrResult("", 99.0, 3)))
+
+
+def overlay_screen_image() -> Image.Image:
+    """Синтетический «игровой» экран: текст в разных местах, часть — уже по-русски."""
+    image = Image.new("RGB", (1200, 700), (24, 28, 36))
+    draw = ImageDraw.Draw(image)
+    draw.text((60, 60), "MISSION COMPLETE", fill=(240, 240, 240), font=_font(32))
+    draw.text((60, 130), "You have earned 1250 XP", fill=(220, 220, 210), font=_font(22))
+    draw.text((60, 220), "Press SPACE to continue", fill=(200, 200, 200), font=_font(20))
+    draw.text((820, 330), "Health: 87", fill=(230, 120, 120), font=_font(24))
+    draw.text((900, 600), "уже переведено", fill=(150, 200, 150), font=_font(18))
+    return image
+
+
+def test_overlay_blocks() -> None:
+    """Оверлей: OCR со координатами, фильтр русского, разметка и плашки."""
+    image = overlay_screen_image()
+    blocks = app.ocr_text_blocks(image)
+    check("оверлей: блоки найдены", len(blocks) >= 4, repr(blocks))
+    texts = " ".join(block.text for block in blocks)
+    check("оверлей: текст распознан", "MISSION COMPLETE" in texts, repr(texts))
+    check("оверлей: рамки внутри кадра",
+          all(0 <= block.rect[0] and 0 <= block.rect[1]
+              and block.rect[0] + block.rect[2] <= image.width
+              and block.rect[1] + block.rect[3] <= image.height for block in blocks),
+          repr([b.rect for b in blocks]))
+    check("оверлей: высота строки правдоподобна",
+          all(6 <= block.line_h <= 120 for block in blocks),
+          repr([round(b.line_h) for b in blocks]))
+
+    pending = [block for block in blocks if app.should_translate_block(block.text)]
+    check("оверлей: русский блок не переводим",
+          all("уже переведено" not in block.text for block in pending), repr(pending))
+    check("оверлей: английские блоки переводим",
+          any("MISSION" in block.text for block in pending), repr(pending))
+
+    translations = [f"перевод {index}" for index in range(1, len(pending) + 1)]
+    layouts = app.build_overlay_layouts(pending, translations, image.size)
+    check("оверлей: плашки построены", len(layouts) == len(pending), repr(len(layouts)))
+    check("оверлей: плашки внутри кадра",
+          all(0 <= x and 0 <= y and x + w <= image.width and y + h <= image.height
+              for (x, y, w, h), _lines, _size in layouts),
+          repr([rect for rect, _l, _s in layouts]))
+    check("оверлей: шрифт в допустимых пределах",
+          all(app.OVERLAY_MIN_FONT_PX <= size <= app.OVERLAY_MAX_FONT_PX
+              for _rect, _lines, size in layouts),
+          repr([size for _r, _l, size in layouts]))
+    check("оверлей: строки перевода непустые",
+          all(lines and lines[0] for _rect, lines, _size in layouts))
+    check("оверлей: пустой перевод пропускается",
+          app.build_overlay_layouts(pending, [None] * len(pending), image.size) == [])
+
+    check("оверлей: looks_russian", app.looks_russian("Привет, мир") and
+          not app.looks_russian("Hello world"))
+    check("оверлей: цифры не переводим", not app.should_translate_block("123 456"))
+    check("оверлей: короткое не переводим", not app.should_translate_block("ab"))
+
+
+def test_numbered_translations() -> None:
+    """Разбор нумерованного ответа модели для плашек."""
+    cases = [
+        ("1. Раз\n2. Два\n3. Три", ["Раз", "Два", "Три"]),
+        ("1) Раз\n2) Два", ["Раз", "Два"]),
+        ("1. Раз\nпродолжение строки\n2. Два", ["Раз продолжение строки", "Два"]),
+        ("без номеров", [None, None]),
+        ("", [None, None]),
+        ("1. Раз\n4. Лишний", ["Раз", None]),
+    ]
+    for raw, expected in cases:
+        got = app.parse_numbered_translations(raw, len(expected))
+        check(f"оверлей: разбор {raw[:18]!r}", got == expected, f"-> {got!r}")
+    check("оверлей: пустой список", app.parse_numbered_translations("1. Раз", 0) == [])
+
+
+def test_overlay_hotkey() -> None:
+    """Клавиша оверлея не конфликтует с остальными."""
+    original = (app.CONFIG.get("overlay_hotkey"), app.CONFIG.get("hotkey"),
+                app.CONFIG.get("analyze_hotkey"))
+    try:
+        app.CONFIG["overlay_hotkey"] = "windows+shift+t"
+        check("оверлей: клавиша по умолчанию",
+              app.effective_overlay_hotkey() == "windows+shift+t",
+              app.effective_overlay_hotkey())
+        app.CONFIG["overlay_hotkey"] = app.CONFIG["hotkey"]
+        check("оверлей: конфликт с переводом заменяется",
+              app.effective_overlay_hotkey() != app.effective_hotkey(),
+              app.effective_overlay_hotkey())
+        app.CONFIG["overlay_hotkey"] = "windows+shift+s"
+        check("оверлей: системное сочетание не берётся",
+              app.effective_overlay_hotkey() != "windows+shift+s",
+              app.effective_overlay_hotkey())
+    finally:
+        (app.CONFIG["overlay_hotkey"], app.CONFIG["hotkey"],
+         app.CONFIG["analyze_hotkey"]) = original
 
 
 def test_split_blocks() -> None:
@@ -608,7 +702,7 @@ def main() -> int:
     print("Офлайн-проверки pyAutoImgTranslate")
     for test in (test_text_presence, test_real_photos, test_split_blocks, test_no_text_answers,
                  test_stream_visible_text, test_stream_completion, test_jobs,
-                 test_ocr_data_grouping, test_ocr_confirm, test_api_key_sources, test_capture_mode_helpers,
+                 test_ocr_data_grouping, test_ocr_confirm, test_overlay_blocks, test_numbered_translations, test_overlay_hotkey, test_api_key_sources, test_capture_mode_helpers,
                  test_analysis_parsing, test_search_layer, test_autostart_helpers):
         print(f"\n== {test.__name__}")
         test()
