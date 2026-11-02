@@ -1,4 +1,4 @@
-"""Офлайн-проверки логики pyAutoImgTranslate: без сети, без GUI, без хоткеев.
+﻿"""Офлайн-проверки логики pyAutoImgTranslate: без сети, без GUI, без хоткеев.
 
 Запуск:
     .venv\\Scripts\\python.exe tests\\test_offline.py         (Windows)
@@ -160,30 +160,55 @@ def big_text_image(lines: int = 40, size=(3840, 2160), font_size=28) -> Image.Im
     return image
 
 
+def photo_with_text_image(seed=3, color=(255, 255, 255), font_size=24, lines=None) -> Image.Image:
+    """Текст на пёстром фоне — ровно тот случай, который раньше пропускался."""
+    rng = np.random.default_rng(seed)
+    small = rng.integers(30, 200, (310 // 24, 988 // 24, 3), dtype=np.uint8)
+    image = Image.fromarray(small, "RGB").resize((988, 310), Image.Resampling.BICUBIC)
+    image = image.filter(ImageFilter.GaussianBlur(2.0))
+    data = np.asarray(image).astype(np.int16) + rng.normal(0, 8, (310, 988, 3))
+    image = Image.fromarray(np.clip(data, 0, 255).astype(np.uint8), "RGB")
+    draw = ImageDraw.Draw(image)
+    font = _font(font_size)
+    for index, line in enumerate(lines or ["Total score: 12450", "Level 7 unlocked"]):
+        draw.text((40, 40 + index * 40), line, fill=color, font=font)
+    return image
+
+
 def test_text_presence() -> None:
-    """Снимки с текстом обрабатываются, снимки без текста — пропускаются."""
-    samples: list[tuple[str, Image.Image, bool]] = [
-        ("три строки текста", text_image(["Привет, мир!", "Это тестовая строка", "Третья строка"]), True),
-        ("одно слово", text_image(["Настройки"]), True),
-        ("два слова", text_image(["Настройки", "Интерфейс"]), True),
-        ("мелкий текст", text_image(["Мелкий текст на строке"], size=(400, 120), font_size=14), True),
-        ("короткое «OK»", two_letters_image(), True),
-        ("однотонная заливка", solid_image(), False),
-        ("градиент", gradient_image(), False),
-        ("шум", noise_image(), False),
-        ("фотография", photo_like_image(), False),
-        ("зернистая фотография", grain_photo_image(), False),
-        ("фото с прямоугольниками", photo_with_rects_image(), False),
-        ("иконки и фигуры", icon_like_image(), False),
-        ("интерфейс без надписей", ui_mock_image(), False),
+    """Текст всегда переводится, а заведомо пустые кадры пропускаются."""
+    must_process: list[tuple[str, Image.Image]] = [
+        ("три строки текста", text_image(["Привет, мир!", "Это тестовая строка", "Третья строка"])),
+        ("одно слово", text_image(["Настройки"])),
+        ("два слова", text_image(["Настройки", "Интерфейс"])),
+        ("мелкий текст", text_image(["Мелкий текст на строке"], size=(400, 120), font_size=14)),
+        ("короткое «OK»", two_letters_image()),
+        # Регрессия: текст на фотографии больше не должен отбрасываться.
+        ("текст на фото", photo_with_text_image()),
+        ("тёмный текст на фото", photo_with_text_image(seed=5, color=(20, 20, 20), font_size=20)),
+        ("текст на тёмном фото", photo_with_text_image(seed=9, color=(240, 240, 240),
+                                                       font_size=22)),
     ]
-    print("\nПроверка «есть ли текст» (оценка / уверенно / деталей / итог / ожидание):")
-    for name, image, expected in samples:
+    must_skip: list[tuple[str, Image.Image]] = [
+        ("однотонная заливка", solid_image()),
+        ("градиент", gradient_image()),
+        ("иконки и фигуры", icon_like_image()),
+        ("интерфейс без надписей", ui_mock_image()),
+    ]
+
+    print("\nПроверка «есть ли текст» (оценка / уверенно / деталей / итог):")
+    for name, image in must_process:
         score, confident, glyphs = app.analyse_text_presence(image)
         verdict = app.image_has_text(image)
-        print(f"  {name:24} score={score:5.0f} уверенно={str(confident):5} деталей={glyphs:5d} "
-              f"итог={str(verdict):5} ожидалось={expected}")
-        check(f"фильтр: {name} → {expected}", verdict == expected, f"получено {verdict}")
+        print(f"  {name:26} score={score:5.0f} уверенно={str(confident):5} "
+              f"деталей={glyphs:5d} итог={verdict}")
+        check(f"фильтр: {name} — переводим", verdict is True, f"получено {verdict}")
+    for name, image in must_skip:
+        score, confident, glyphs = app.analyse_text_presence(image)
+        verdict = app.image_has_text(image)
+        print(f"  {name:26} score={score:5.0f} уверенно={str(confident):5} "
+              f"деталей={glyphs:5d} итог={verdict}")
+        check(f"фильтр: {name} — пропускаем", verdict is False, f"получено {verdict}")
 
     # Слишком маленький снимок не считаем текстом.
     tiny = Image.new("RGB", (4, 4), "white")
@@ -197,25 +222,58 @@ def test_text_presence() -> None:
     if sample.is_file():
         image = Image.open(sample)
         score, confident, glyphs = app.analyse_text_presence(image)
-        print(f"  {sample.name:24} score={score:5.0f} уверенно={confident} деталей={glyphs}")
+        print(f"  {sample.name:26} score={score:5.0f} уверенно={confident} деталей={glyphs}")
         check("фильтр: реальный скриншот — текст", app.image_has_text(image))
+
+    # Пёстрые снимки без текста могут уйти модели (она ответит NO_TEXT) —
+    # это осознанный компромисс: пропустить настоящий перевод хуже.
+    for name, image in (("шум", noise_image()), ("фото", photo_like_image()),
+                        ("фото с прямоугольниками", photo_with_rects_image())):
+        verdict = app.image_has_text(image)
+        print(f"  {name:26} итог={verdict} (допустимо любое)")
 
 
 def test_real_photos() -> None:
-    """Реальные фотографии без текста (обои Windows), если они есть на машине."""
+    """Реальные фотографии (обои Windows), если они есть на машине.
+
+    Часть фотографий структурный анализ принимает за текст — такие уходят
+    модели, и она отвечает NO_TEXT. Проверяем, что фильтр всё-таки работает:
+    пустые кадры пропускаются.
+    """
     photos = sorted(glob.glob(r"C:\Windows\Web\Wallpaper\**\*.jpg", recursive=True))[:8]
     if not photos:
         print("\nРеальные фотографии не найдены — проверка пропущена.")
         return
-    print("\nРеальные фотографии (ожидается «нет текста»):")
-    positives = 0
+    print("\nРеальные фотографии:")
+    skipped = 0
     for path in photos:
         image = Image.open(path).convert("RGB")
         verdict = app.image_has_text(image)
-        positives += 1 if verdict else 0
-        print(f"  {Path(path).name:20} текст={verdict}")
-    check("фильтр: фотографии в основном без текста", positives <= 2,
-          f"текстом признано {positives} из {len(photos)}")
+        skipped += 0 if verdict else 1
+        print(f"  {Path(path).name:20} переводим={verdict}")
+    check("фильтр: часть фотографий пропускается", skipped >= 3,
+          f"пропущено {skipped} из {len(photos)}")
+
+
+def test_ocr_confirm() -> None:
+    """Проверочный OCR: варианты подготовки и пороги уверенности."""
+    image = photo_with_text_image()
+    prepared_raw = app._ocr_check_image(image, "raw")
+    prepared_otsu = app._ocr_check_image(image, "otsu")
+    check("OCR-проверка: «как есть» не меняет размера",
+          prepared_raw.size == image.size, repr(prepared_raw.size))
+    values = set(np.unique(np.array(prepared_otsu)))
+    check("OCR-проверка: бинаризация даёт чёрно-белое",
+          values.issubset({0, 255}), repr(sorted(values)[:5]))
+
+    def verdict(words: int, confidence: float, text: str = "текст") -> bool:
+        return app._ocr_confirms_text(app.OcrResult(text, confidence, words))
+
+    check("OCR-порог: уверенный текст", verdict(3, 80.0))
+    check("OCR-порог: два слова с уверенностью 55", verdict(2, 55.0))
+    check("OCR-порог: мусор на фото (2 слова, 40)", not verdict(2, 40.0))
+    check("OCR-порог: одно слово требует 75", not verdict(1, 70.0) and verdict(1, 80.0))
+    check("OCR-порог: пустой текст", not app._ocr_confirms_text(app.OcrResult("", 99.0, 3)))
 
 
 def test_split_blocks() -> None:
@@ -550,7 +608,7 @@ def main() -> int:
     print("Офлайн-проверки pyAutoImgTranslate")
     for test in (test_text_presence, test_real_photos, test_split_blocks, test_no_text_answers,
                  test_stream_visible_text, test_stream_completion, test_jobs,
-                 test_ocr_data_grouping, test_api_key_sources, test_capture_mode_helpers,
+                 test_ocr_data_grouping, test_ocr_confirm, test_api_key_sources, test_capture_mode_helpers,
                  test_analysis_parsing, test_search_layer, test_autostart_helpers):
         print(f"\n== {test.__name__}")
         test()

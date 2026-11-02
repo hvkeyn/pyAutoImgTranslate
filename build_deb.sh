@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # Сборка .deb-пакета pyAutoImgTranslate для Debian/Ubuntu.
 #
 # Использует dist/pyAutoImgTranslate (уже собранный PyInstaller-бинарник).
@@ -7,7 +7,7 @@
 # Требуется: dpkg-deb (пакет dpkg-dev). Сборку запускать в Debian/Ubuntu.
 set -euo pipefail
 
-VERSION="${1:-1.8.1}"
+VERSION="${1:-1.8.2}"
 ARCH="$(dpkg --print-architecture)"
 PKG="pyautoimgtranslate"
 ROOT="$(cd "$(dirname "$0")" && pwd)"

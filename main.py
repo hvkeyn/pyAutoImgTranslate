@@ -1,4 +1,4 @@
-"""
+﻿"""
 pyAutoImgTranslate — перевод текста с экрана.
 
 Возможности:
@@ -48,7 +48,7 @@ import requests
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageGrab, ImageTk
 
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
@@ -172,7 +172,7 @@ DEFAULT_CONFIG = {
     "add_to_autostart": False,
     "keep_image_on_top": False,
     "live_on_top": True,        # окно режима «на лету» показывать поверх других окон
-    "skip_no_text": True,       # не тратить запрос, если на снимке нет текста
+    "skip_no_text": True,       # пропускать заведомо пустые снимки (без запроса)
     "stream_results": True,     # показывать перевод по мере генерации (потоком)
     "capture_timeout": 60,      # сколько секунд ждать выделения области
     # Как выделять область: "builtin" — своим оверлеем (как Win+Shift+S),
@@ -728,9 +728,12 @@ def _configure_tesseract() -> None:
 
 
 MIN_OCR_CONFIDENCE = 40.0
-# Сколько «глифоподобных» деталей на снимке считать признаком пёстрой картинки,
-# которую стоит проверить локальным OCR, даже если строк не нашлось.
-TEXTURE_GLYPHS_LIMIT = 60
+# Сколько «глифоподобных» деталей на снимке считать признаком непустого кадра.
+# Меньше — проверяем локальным OCR; больше — отправляем модели, даже если строки
+# не сложились (текст на пёстром фоне — обычное дело в играх и на фото).
+EMPTY_GLYPHS_LIMIT = 8
+# Варианты подготовки картинки к проверочному OCR.
+OCR_CHECK_VARIANTS = ("raw", "clahe", "otsu", "otsu_inv")
 
 
 class OcrResult:
@@ -964,60 +967,105 @@ def analyse_text_presence(image: Image.Image) -> tuple[float, bool, int]:
     return best, has_text, len(glyphs)
 
 
+def _ocr_check_image(image: Image.Image, variant: str) -> Image.Image:
+    """Уменьшенная копия снимка для проверочного OCR (варианты подготовки).
+
+    Текст на фотографии почти не читается «как есть», зато читается после
+    выравнивания контраста или бинаризации — поэтому проверяем несколько вариантов.
+    """
+    small = image if max(image.size) <= 1100 else _fit_for_preview(image, 1100, 1100)
+    if variant == "raw":
+        return small
+    gray = np.array(small.convert("L"))
+    if variant == "clahe":
+        equalized = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+        return Image.fromarray(equalized, "L")
+    if variant in ("otsu", "otsu_inv"):
+        mode = cv2.THRESH_BINARY_INV if variant == "otsu_inv" else cv2.THRESH_BINARY
+        _value, binary = cv2.threshold(gray, 0, 255, mode | cv2.THRESH_OTSU)
+        return Image.fromarray(binary, "L")
+    return small
+
+
+def _ocr_confirms_text(result: OcrResult) -> bool:
+    """Достаточно ли уверенно OCR прочитал текст в одном из вариантов.
+
+    Порог завышен намеренно: OCR на фактуре фотографии выдаёт «слова» с
+    уверенностью 30–50, и путать их с текстом нельзя. Реальный текст на снимке
+    даже через бинаризацию читается с уверенностью 70+.
+    """
+    text = (result.text or "").strip()
+    if len(text) < 2:
+        return False
+    if result.words >= 2:
+        return result.confidence >= 55.0
+    # Одиночное короткое «слово» легко получается из фигур (кружок похож на «O»),
+    # поэтому для него требуем заметно более высокую уверенность.
+    return result.confidence >= 75.0
+
+
 def confirm_text_with_ocr(image: Image.Image) -> bool | None:
-    """Уточняет «есть ли текст» локальным OCR (Tesseract).
+    """Ищет текст локальным OCR (Tesseract) на нескольких вариантах картинки.
 
-    Именно OCR надёжно отличает текст от фактуры фотографии, поэтому спорные
-    снимки отдаём ему. Проверка идёт на уменьшенной копии и в быстром режиме
-    (LSTM), чтобы не задерживать обработку.
-
+    Проверка нужна только для снимков, где структурный анализ не увидел строк:
+    текст может быть мелким, низкоконтрастным или лежать на пёстром фоне.
     Возвращает True/False или None, если проверить не удалось (Tesseract не
     установлен, ошибка распознавания) — тогда решение принимает вызывающий.
     """
     try:
         _configure_tesseract()
-        small = image if max(image.size) <= 1100 else _fit_for_preview(image, 1100, 1100)
-        data = pytesseract.image_to_data(
-            small, lang=CONFIG.get("ocr_lang", "eng+rus"), config="--psm 6 --oem 1",
-            output_type=pytesseract.Output.DICT,
-        )
     except Exception as exc:  # noqa: BLE001
         logger.info("Проверка через Tesseract недоступна: %s", exc)
         return None
-    result = _ocr_result_from_data(data)
-    logger.info("Локальная проверка текста: %r", result)
-    text = result.text.strip()
-    if len(text) < 2:
-        return False
-    threshold = float(CONFIG.get("min_ocr_confidence") or MIN_OCR_CONFIDENCE)
-    # Одиночное короткое «слово» легко получается из фигур (кружок похож на «O»),
-    # поэтому для него требуем заметно более высокую уверенность.
-    if result.words >= 2:
-        return result.confidence >= threshold
-    return result.confidence >= max(75.0, threshold + 25.0)
+    checked = False
+    for variant in OCR_CHECK_VARIANTS:
+        try:
+            prepared = _ocr_check_image(image, variant)
+            data = pytesseract.image_to_data(
+                prepared, lang=CONFIG.get("ocr_lang", "eng+rus"), config="--psm 6 --oem 1",
+                output_type=pytesseract.Output.DICT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Проверка через Tesseract (%s) не удалась: %s", variant, exc)
+            continue
+        checked = True
+        result = _ocr_result_from_data(data)
+        logger.info("Проверка текста (%s): %r", variant, result)
+        if _ocr_confirms_text(result):
+            return True
+    return False if checked else None
 
 
 def image_has_text(image: Image.Image) -> bool:
     """Итоговое решение «стоит ли отправлять этот снимок на перевод».
 
-    Сначала дешёвая проверка структуры. Если строк текста не видно и деталей на
-    снимке мало (заливка, градиент, простой пейзаж) — сразу «нет», без OCR.
-    В остальных случаях последнее слово за локальным OCR: он надёжно отличает
-    текст от фактуры фотографии. Если OCR недоступен — снимок всё равно
-    обрабатывается: лучше лишний запрос, чем потерянный перевод.
+    Пропускаем только заведомо пустые кадры (заливка, градиент, пустой
+    интерфейс, снимок без деталей). Если структурный анализ увидел строки —
+    обрабатываем. Если строк не видно, но деталей много — тоже обрабатываем:
+    это может быть текст на пёстром фоне (игра, фотография), а ошибочно
+    пропущенный перевод гораздо хуже одного лишнего запроса. Когда текста
+    действительно нет, модель сама ответит NO_TEXT и окно не появится.
     """
     score, confident, glyphs = analyse_text_presence(image)
-    if score <= 0 and glyphs < TEXTURE_GLYPHS_LIMIT:
-        logger.info("Текстовых структур на снимке нет (оценка 0, деталей %d).", glyphs)
-        return False
-    verdict = confirm_text_with_ocr(image)
-    if verdict is None:
-        logger.info("Оценка %.0f (уверенно=%s, деталей %d), подтвердить нечем — обрабатываю.",
-                    score, confident, glyphs)
+    if confident or score >= 3.0:
+        logger.info("Проверка текста: структура похожа на текст (оценка %.0f, деталей %d).",
+                    score, glyphs)
         return True
-    logger.info("Оценка %.0f (уверенно=%s, деталей %d), локальная проверка: текст=%s.",
-                score, confident, glyphs, verdict)
-    return verdict
+    if glyphs >= EMPTY_GLYPHS_LIMIT:
+        logger.info("Проверка текста: строк нет, но деталей %d — отдаю модели решать.", glyphs)
+        return True
+    verdict = confirm_text_with_ocr(image)
+    if verdict:
+        logger.info("Проверка текста: локальный OCR нашёл текст (оценка %.0f, деталей %d).",
+                    score, glyphs)
+        return True
+    if verdict is None:
+        logger.info("Проверка текста: подтвердить нечем (оценка %.0f, деталей %d) — обрабатываю.",
+                    score, glyphs)
+        return True
+    logger.info("Проверка текста: снимок почти пуст (оценка %.0f, деталей %d) — пропускаю.",
+                score, glyphs)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -3340,7 +3388,7 @@ def open_settings_window(parent: tk.Misc | None = None) -> None:
         tk.Checkbutton(common, text="Окно «на лету» поверх других", variable=live_on_top_var,
                        **check_opts).grid(row=3, column=2, columnspan=2, sticky="w", pady=(Space.XS, 0))
         skip_no_text_var = tk.BooleanVar(value=bool(CONFIG.get("skip_no_text", True)))
-        tk.Checkbutton(common, text="Пропускать снимки без текста", variable=skip_no_text_var,
+        tk.Checkbutton(common, text="Пропускать пустые снимки (без текста)", variable=skip_no_text_var,
                        **check_opts).grid(row=3, column=0, columnspan=2, sticky="w", pady=(Space.XS, 0))
         stream_var = tk.BooleanVar(value=bool(CONFIG.get("stream_results", True)))
         tk.Checkbutton(common, text="Перевод по мере генерации", variable=stream_var,
