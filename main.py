@@ -50,7 +50,7 @@ import requests
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageGrab, ImageTk
 
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
@@ -2546,6 +2546,39 @@ def _dedupe_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
     return kept
 
 
+def _filter_blocks(blocks: list[TextBlock], *, min_chars: int = 2) -> list[TextBlock]:
+    """Оставляет осмысленные блоки: рамка в кадре, буквы, без мусора из значков."""
+    result: list[TextBlock] = []
+    for block in blocks:
+        left, top, width_, height_ = block.rect
+        if left < 0 or top < 0 or width_ < 3 or height_ < 6:
+            continue
+        text = block.text.replace("\n", " ").strip()
+        if len(text) < min_chars or len(text) > 400:
+            continue
+        letters = sum(1 for char in text if char.isalpha())
+        visible = sum(1 for char in text if not char.isspace())
+        if letters < 2 or (visible and letters / visible < 0.55):
+            continue        # «Е] x», «--- 8 --» и прочий мусор из значков
+        result.append(block)
+    result.sort(key=lambda item: (item.rect[1], item.rect[0]))
+    return result
+
+
+def _blocks_from_words(words: list[tuple[int, int, int, int, str, float]],
+                       *, min_chars: int = 2) -> list[TextBlock]:
+    """Слова → строки → куски строк → абзацы (вся геометрия в одном месте)."""
+    if not words:
+        return []
+    line_blocks: list[TextBlock] = []
+    for line in _words_to_lines(words):
+        for segment in _line_segments(line["words"], line["height"]):
+            line_blocks.append(_block_from_words(segment, float(line["height"])))
+    blocks = _dedupe_blocks(line_blocks)
+    blocks = _merge_paragraphs(blocks)
+    return _filter_blocks(blocks, min_chars=min_chars)
+
+
 def ocr_text_blocks(image: Image.Image, *, min_confidence: float = 35.0,
                     min_chars: int = 2, overlap: int = 24,
                     psm: str = "--psm 11 --oem 1") -> list[TextBlock]:
@@ -2572,31 +2605,7 @@ def ocr_text_blocks(image: Image.Image, *, min_confidence: float = 35.0,
     else:
         for box in boxes:
             words.extend(_ocr_tile_words(image, box, min_confidence=min_confidence, psm=psm))
-
-    if not words:
-        return []
-    line_blocks: list[TextBlock] = []
-    for line in _words_to_lines(words):
-        for segment in _line_segments(line["words"], line["height"]):
-            line_blocks.append(_block_from_words(segment, float(line["height"])))
-    blocks = _dedupe_blocks(line_blocks)
-    blocks = _merge_paragraphs(blocks)
-
-    result: list[TextBlock] = []
-    for block in blocks:
-        left, top, width_, height_ = block.rect
-        if left < 0 or top < 0 or width_ < 3 or height_ < 6:
-            continue
-        text = block.text.replace("\n", " ").strip()
-        if len(text) < min_chars or len(text) > 400:
-            continue
-        letters = sum(1 for char in text if char.isalpha())
-        visible = sum(1 for char in text if not char.isspace())
-        if letters < 2 or (visible and letters / visible < 0.55):
-            continue        # «Е] x», «--- 8 --» и прочий мусор из значков
-        result.append(block)
-    result.sort(key=lambda item: (item.rect[1], item.rect[0]))
-    return result
+    return _blocks_from_words(words, min_chars=min_chars)
 
 
 def screen_signature(image: Image.Image, size: tuple[int, int] = (96, 54)) -> str:
@@ -2682,8 +2691,8 @@ def translate_blocks(texts: list[str], job=None) -> list[str | None]:
 # новыми строками.
 _OVERLAY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _OVERLAY_CACHE_LIMIT = 800
-OVERLAY_CHUNK = 16          # блоков в одной пачке
-OVERLAY_MAX_WORKERS = 3     # сколько пачек переводить одновременно
+OVERLAY_CHUNK = 9           # блоков в одной пачке: меньше пачка — раньше первые плашки
+OVERLAY_MAX_WORKERS = 6     # сколько пачек переводить одновременно
 
 
 def overlay_cache_key(text: str) -> str:
@@ -2714,16 +2723,22 @@ def overlay_translate(texts: list[str], job=None, *, on_batch=None) -> list[str 
 
     Недостающее режется на пачки и переводится параллельно; после каждой
     готовой пачки вызывается on_batch — так плашки появляются постепенно.
+    Одинаковые надписи отправляются один раз, даже если встречаются несколько
+    раз (для интерфейсов это обычное дело).
     """
     results: list[str | None] = [overlay_cache_get(text) for text in texts]
-    missing = [(index, text) for index, text in enumerate(texts) if results[index] is None]
-    if not missing:
+    by_key: "OrderedDict[str, list[int]]" = OrderedDict()
+    for index, text in enumerate(texts):
+        if results[index] is None:
+            by_key.setdefault(overlay_cache_key(text), []).append(index)
+    if not by_key:
         return results
-    chunks = [missing[i:i + OVERLAY_CHUNK] for i in range(0, len(missing), OVERLAY_CHUNK)]
+    entries = [(key, texts[indices[0]], indices) for key, indices in by_key.items()]
+    chunks = [entries[i:i + OVERLAY_CHUNK] for i in range(0, len(entries), OVERLAY_CHUNK)]
     workers = min(OVERLAY_MAX_WORKERS, len(chunks))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(translate_blocks, [text for _index, text in chunk], job): chunk
+            pool.submit(translate_blocks, [text for _key, text, _indices in chunk], job): chunk
             for chunk in chunks
         }
         for future in as_completed(futures):
@@ -2735,10 +2750,12 @@ def overlay_translate(texts: list[str], job=None, *, on_batch=None) -> list[str 
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Оверлей: пачка перевода не удалась: %s", exc)
                 continue
-            for (index, text), value in zip(chunk, translated):
-                if value:
+            for (_key, text, indices), value in zip(chunk, translated):
+                if not value:
+                    continue
+                overlay_cache_put(text, value)
+                for index in indices:
                     results[index] = value
-                    overlay_cache_put(text, value)
             if on_batch is not None:
                 on_batch()
     # Строки, которые модель не вернула (сбилась нумерация), добиваем по одной.
@@ -2962,6 +2979,9 @@ class OverlayController:
         self._window: "OverlayWindow | None" = None
         self._lock = threading.Lock()
         self._last_digest = ""
+        # Кэш распознавания по тайлам: неизменные части экрана не OCR-ятся заново.
+        self._tile_cache: dict[tuple[int, int, int, int],
+                               tuple[str, list[TextBlock]]] = {}
 
     # --- состояние --------------------------------------------------------
     def enabled(self) -> bool:
@@ -2999,6 +3019,7 @@ class OverlayController:
             self._enabled = True
             self._stop.clear()
             self._last_digest = ""
+            self._tile_cache.clear()
             self._window = OverlayWindow(area)
             window = self._window
         run_on_ui(window.build)
@@ -3033,6 +3054,38 @@ class OverlayController:
         self.start()
 
     # --- цикл -------------------------------------------------------------
+    def _recognize(self, shot: Image.Image) -> tuple[list[TextBlock], int]:
+        """Распознаёт кадр по тайлам, неизменные тайлы берёт из кэша.
+
+        Игра/окно обычно меняется не целиком: новый диалог — это один-два
+        тайла. Тогда OCR занимает доли секунды вместо полного прохода.
+        """
+        width, height = shot.size
+        _configure_tesseract()
+        boxes = _overlay_tiles(width, height)
+        cached = self._tile_cache
+        parts: list[list[TextBlock]] = []
+        stale: list[tuple[tuple[int, int, int, int], str]] = []
+        for box in boxes:
+            signature = screen_signature(shot.crop(box), (256, 144))
+            hit = cached.get(box)
+            if hit is not None and hit[0] == signature:
+                parts.append(hit[1])
+            else:
+                stale.append((box, signature))
+        if stale:
+            workers = min(8, len(stale))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                recognised = list(pool.map(
+                    lambda item: _ocr_tile_words(shot, item[0], min_confidence=35.0,
+                                                 psm="--psm 11 --oem 1"), stale))
+            for (box, signature), words in zip(stale, recognised):
+                blocks = _blocks_from_words(words)
+                cached[box] = (signature, blocks)
+                parts.append(blocks)
+        combined = [block for part in parts for block in part]
+        return _filter_blocks(_merge_paragraphs(_dedupe_blocks(combined))), len(stale)
+
     def _loop(self, window: OverlayWindow) -> None:
         cancel = _OverlayCancel(self._stop)
         interval = max(0.5, float(CONFIG.get("overlay_interval") or 1.0))
@@ -3053,9 +3106,11 @@ class OverlayController:
                     continue
                 last_signature = signature
                 ocr_started = time.time()
-                blocks = ocr_text_blocks(shot)
+                blocks, changed_tiles = self._recognize(shot)
                 ocr_ms = (time.time() - ocr_started) * 1000
                 pending = [block for block in blocks if should_translate_block(block.text)]
+                # Крупные надписи — первыми: они заметнее, плашки появятся раньше.
+                pending.sort(key=lambda block: -block.rect[2] * block.rect[3])
                 if not pending:
                     run_on_ui(window.clear)
                     self._last_digest = ""
@@ -3065,8 +3120,8 @@ class OverlayController:
                 self._redraw(window, pending)
                 texts = [block.text for block in pending]
                 cached = sum(1 for text in texts if overlay_cache_get(text))
-                logger.info("Оверлей: OCR %.0f мс, блоков %d, из кэша %d.",
-                            ocr_ms, len(pending), cached)
+                logger.info("Оверлей: OCR %.0f мс (%d тайлов), блоков %d, из кэша %d.",
+                            ocr_ms, changed_tiles, len(pending), cached)
                 # 2. Догружаем новые строки пачками; после каждой пачки — перерисовка.
                 translate_started = time.time()
                 translations = overlay_translate(
