@@ -7,7 +7,7 @@
 # Требуется: dpkg-deb (пакет dpkg-dev). Сборку запускать в Debian/Ubuntu.
 set -euo pipefail
 
-VERSION="${1:-1.9.0}"
+VERSION="${1:-1.9.1}"
 ARCH="$(dpkg --print-architecture)"
 PKG="pyautoimgtranslate"
 ROOT="$(cd "$(dirname "$0")" && pwd)"

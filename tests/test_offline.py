@@ -370,6 +370,80 @@ def test_overlay_hotkey() -> None:
          app.CONFIG["analyze_hotkey"]) = original
 
 
+def test_overlay_ocr_native() -> None:
+    """Мелкий текст по всему экрану находится: тайлы, швы и сборка строк."""
+    image = Image.new("RGB", (2600, 900), (22, 26, 34))
+    draw = ImageDraw.Draw(image)
+    font = _font(11)
+    expected = []
+    for row in range(8):
+        for col in range(4):
+            text = f"Line {row}-{col} value {row * 10 + col}"
+            expected.append(text)
+            draw.text((40 + col * 640, 40 + row * 100), text, fill=(235, 235, 235), font=font)
+    blocks = app.ocr_text_blocks(image)
+    joined = " ".join(block.text for block in blocks)
+    found = sum(1 for text in expected if text.lower() in joined.lower())
+    print(f"  мелкий текст: найдено {found} из {len(expected)}")
+    check("оверлей: мелкий текст по всему экрану находится", found >= len(expected) - 2,
+          f"найдено {found} из {len(expected)}")
+
+    tiles = app._overlay_tiles(2600, 900, tile_w=1400, tile_h=900, overlap=24)
+    covered = set()
+    for left, top, right, bottom in tiles:
+        for x in range(left, right, 7):
+            for y in range(top, bottom, 7):
+                covered.add((x // 7, y // 7))
+    total_cells = {(x // 7, y // 7) for x in range(0, 2600, 7) for y in range(0, 900, 7)}
+    check("оверлей: тайлы покрывают весь кадр", len(covered) / len(total_cells) > 0.97,
+          f"покрыто {len(covered) / len(total_cells):.2f}")
+    check("оверлей: тайлов больше одного", len(tiles) >= 2, repr(len(tiles)))
+
+    words = [(10, 10, 60, 14, "Play", 90.0), (80, 10, 50, 14, "game", 90.0),
+             (900, 10, 70, 14, "Settings", 90.0), (980, 10, 50, 14, "now", 90.0)]
+    segments = app._line_segments(words, 14.0)
+    check("оверлей: строка режется по промежутку", len(segments) == 2, repr(segments))
+    check("оверлей: куски строки собираются по словам",
+          " ".join(word[4] for word in segments[0]) == "Play game"
+          and " ".join(word[4] for word in segments[1]) == "Settings now")
+
+
+def test_overlay_signature_and_cache() -> None:
+    """Отпечаток кадра и кэш переводов: повторный кадр не ходит в сеть."""
+    base = Image.new("RGB", (400, 300), (20, 20, 20))
+    same = base.copy()
+    changed = base.copy()
+    ImageDraw.Draw(changed).rectangle((10, 10, 100, 40), fill=(240, 240, 240))
+    check("оверлей: одинаковый кадр — один отпечаток",
+          app.screen_signature(base) == app.screen_signature(same))
+    check("оверлей: изменённый кадр — другой отпечаток",
+          app.screen_signature(base) != app.screen_signature(changed))
+
+    app.overlay_cache_clear()
+    calls = {"count": 0}
+    original = app.translate_blocks
+
+    def fake(texts, job=None):
+        calls["count"] += 1
+        return [f"перевод: {text}" for text in texts]
+
+    app.translate_blocks = fake
+    try:
+        texts = ["Play", "Settings", "Play", "Continue"]
+        first = app.overlay_translate(texts)
+        check("оверлей: кэш перевёл всё", all(first), repr(first))
+        check("оверлей: дубликаты в одном запросе", calls["count"] == 1, repr(calls))
+        second = app.overlay_translate(texts)
+        check("оверлей: повтор из кэша без запроса", calls["count"] == 1, repr(calls))
+        check("оверлей: кэш вернул те же переводы", second == first, repr(second))
+        app.overlay_cache_clear()
+        app.overlay_translate(["Play"])
+        check("оверлей: после очистки кэша — новый запрос", calls["count"] == 2, repr(calls))
+    finally:
+        app.translate_blocks = original
+        app.overlay_cache_clear()
+
+
 def test_split_blocks() -> None:
     cases = [
         ("ПЕРЕВОД:\nпривет\nОРИГИНАЛ:\nhello", ("привет", "hello")),
@@ -702,7 +776,7 @@ def main() -> int:
     print("Офлайн-проверки pyAutoImgTranslate")
     for test in (test_text_presence, test_real_photos, test_split_blocks, test_no_text_answers,
                  test_stream_visible_text, test_stream_completion, test_jobs,
-                 test_ocr_data_grouping, test_ocr_confirm, test_overlay_blocks, test_numbered_translations, test_overlay_hotkey, test_api_key_sources, test_capture_mode_helpers,
+                 test_ocr_data_grouping, test_ocr_confirm, test_overlay_blocks, test_numbered_translations, test_overlay_hotkey, test_overlay_ocr_native, test_overlay_signature_and_cache, test_api_key_sources, test_capture_mode_helpers,
                  test_analysis_parsing, test_search_layer, test_autostart_helpers):
         print(f"\n== {test.__name__}")
         test()
