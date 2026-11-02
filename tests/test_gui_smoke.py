@@ -246,6 +246,18 @@ def test_overlay_window() -> None:
         app.run_on_ui(lambda: window.draw(layouts))
         check("оверлей: плашки нарисованы",
               wait_for(lambda: len(window.canvas.find_all()) >= 3))
+        check("оверлей: область подсвечена рамкой",
+              bool(window.canvas.find_withtag("area")),
+              str(len(window.canvas.find_withtag("area"))))
+        plates = len(window.canvas.find_all()) - len(window.canvas.find_withtag("area"))
+        check("оверлей: рамка не мешает плашкам", plates >= 3, str(plates))
+
+        app.CONFIG["overlay_highlight"] = False
+        app.run_on_ui(lambda: window.draw(layouts))
+        check("оверлей: подсветку можно отключить",
+              wait_for(lambda: not window.canvas.find_withtag("area")))
+        app.CONFIG["overlay_highlight"] = True
+
         app.run_on_ui(window.clear)
         check("оверлей: очистка", wait_for(lambda: len(window.canvas.find_all()) == 0))
     finally:
@@ -254,36 +266,68 @@ def test_overlay_window() -> None:
 
 
 def test_overlay_controller() -> None:
-    """Режим включается/выключается и рисует плашки (захват и перевод подменены)."""
+    """Режим включается/выключается, рисует плашки и следит за сменой кадра."""
     image = Image.new("RGB", (900, 500), (24, 28, 36))
     draw = ImageDraw.Draw(image)
     draw.text((40, 40), "MISSION COMPLETE", fill=(240, 240, 240), font=app._overlay_font(30))
     draw.text((40, 120), "Press SPACE to continue", fill=(220, 220, 220),
               font=app._overlay_font(22))
+    second = image.copy()
+    draw2 = ImageDraw.Draw(second)
+    draw2.rectangle((40, 120, 860, 180), fill=(24, 28, 36))
+    draw2.text((40, 120), "Press ESC to quit", fill=(220, 220, 220), font=app._overlay_font(22))
+
     original = {
         "grab": app.ImageGrab.grab,
         "translate": app.translate_blocks,
         "area": app.CONFIG.get("overlay_area"),
         "interval": app.CONFIG.get("overlay_interval"),
+        "highlight": app.CONFIG.get("overlay_highlight"),
     }
-    app.ImageGrab.grab = lambda **kwargs: image.copy()
-    app.translate_blocks = lambda texts, job=None: [f"перевод {i}"
-                                                    for i, _t in enumerate(texts, 1)]
+    frame = {"image": image}
+    calls = {"count": 0}
+
+    def fake_translate(texts, job=None):
+        calls["count"] += 1
+        return [f"перевод {i}" for i, _t in enumerate(texts, 1)]
+
+    app.ImageGrab.grab = lambda **kwargs: frame["image"].copy()
+    app.translate_blocks = fake_translate
+    app.overlay_cache_clear()
     app.CONFIG["overlay_area"] = [0, 0, image.width, image.height]
-    app.CONFIG["overlay_interval"] = 0.8
+    app.CONFIG["overlay_interval"] = 0.4
+    app.CONFIG["overlay_stable"] = 0.0
+    app.CONFIG["overlay_highlight"] = True
+
+    def item_count() -> int:
+        window = app.OVERLAY._window
+        return len(window.canvas.find_all()) if window and window.canvas else 0
+
     try:
         check("оверлей: режим включился", app.OVERLAY.start())
         check("оверлей: режим отмечен включённым", app.is_overlay_enabled())
-        check("оверлей: плашки появились на экране",
-              wait_for(lambda: (app.OVERLAY._window is not None
-                                and app.OVERLAY._window.canvas is not None
-                                and len(app.OVERLAY._window.canvas.find_all()) >= 3), 8.0))
+        check("оверлей: плашки появились на экране", wait_for(lambda: item_count() >= 3, 8.0))
+        check("оверлей: кадр обработан", wait_for(lambda: calls["count"] >= 1, 5.0),
+              str(calls["count"]))
+        # Смена текста на экране: плашки обновляются без перезапуска режима.
+        frame["image"] = second
+        check("оверлей: смена кадра подхватилась",
+              wait_for(lambda: "Press ESC to quit" in " ".join(
+                  block.text for block in app.OVERLAY._blocks), 8.0),
+              repr([block.text for block in app.OVERLAY._blocks]))
+        check("оверлей: перевод для новой строки запрошен",
+              wait_for(lambda: calls["count"] >= 2, 8.0), str(calls["count"]))
+        check("оверлей: рамка области на месте", wait_for(
+            lambda: bool((app.OVERLAY._window.canvas.find_withtag("area")
+                          if app.OVERLAY._window and app.OVERLAY._window.canvas else []))))
     finally:
         app.OVERLAY.stop("тест")
         app.ImageGrab.grab = original["grab"]
         app.translate_blocks = original["translate"]
         app.CONFIG["overlay_area"] = original["area"]
         app.CONFIG["overlay_interval"] = original["interval"]
+        app.CONFIG["overlay_highlight"] = original["highlight"]
+        app.CONFIG["overlay_stable"] = 0.25
     check("оверлей: режим выключился", not app.is_overlay_enabled())
     check("оверлей: окно убрано", wait_for(lambda: app.OVERLAY._window is None))
 

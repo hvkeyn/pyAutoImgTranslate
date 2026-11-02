@@ -1,4 +1,4 @@
-"""
+﻿"""
 pyAutoImgTranslate — перевод текста с экрана.
 
 Возможности:
@@ -50,7 +50,7 @@ import requests
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageGrab, ImageTk
 
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
@@ -186,7 +186,9 @@ DEFAULT_CONFIG = {
     "search_results": 4,            # сколько результатов брать с одного поискового запроса
     "search_timeout": 8,            # таймаут одного поискового запроса, секунды
     # Перевод поверх экрана: период обновления и область (null — весь экран).
-    "overlay_interval": 1.0,
+    "overlay_interval": 0.4,      # как часто снимать кадр, секунды
+    "overlay_stable": 0.2,       # сколько ждать, пока текст перестанет печататься
+    "overlay_highlight": True,    # подсвечивать рамкой область перевода
     "overlay_area": None,
     "overlay_hotkey": "windows+shift+t" if IS_WINDOWS else "ctrl+alt+t",
     "hotkey": _default_hotkey(),
@@ -2370,6 +2372,8 @@ OVERLAY_KEY_COLOR = "#FE00FE"       # цвет-ключ прозрачности
 OVERLAY_PLATE_BG = "#14161B"
 OVERLAY_PLATE_BORDER = "#8B7BFF"
 OVERLAY_TEXT_COLOR = "#F5F6FA"
+OVERLAY_AREA_BORDER = "#5B4CC0"     # лёгкая рамка области перевода
+OVERLAY_AREA_TICK = "#7C6BD8"       # уголки рамки
 OVERLAY_MIN_FONT_PX = 11
 OVERLAY_MAX_FONT_PX = 40
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -2673,12 +2677,47 @@ def parse_numbered_translations(text: str, count: int) -> list[str | None]:
     return results
 
 
-def translate_blocks(texts: list[str], job=None) -> list[str | None]:
-    """Переводит пачку блоков одним запросом, сохраняя порядок."""
+def translate_blocks(texts: list[str], job=None, *, on_partial=None) -> list[str | None]:
+    """Переводит пачку блоков одним запросом, сохраняя порядок.
+
+    Если передан on_partial, ответ читается потоком: каждый готовый перевод
+    сразу кладётся в «черновой» кэш, и плашки появляются по мере генерации,
+    не дожидаясь конца пачки. Черновые значения не попадают в настоящий кэш —
+    недописанная строка не должна запомниться навсегда.
+    """
     if not texts:
         return []
-    answer = _chat_completion(_build_blocks_messages(texts),
-                              label=f"Оверлей: перевод {len(texts)} блоков", job=job)
+    keys = [overlay_cache_key(text) for text in texts]
+    throttle = {"at": 0.0}
+    lock = threading.Lock()
+
+    def handle(raw: str) -> None:
+        parsed = parse_numbered_translations(raw, len(texts))
+        last = max((index for index, value in enumerate(parsed) if value), default=-1)
+        changed = False
+        with lock:
+            for index, value in enumerate(parsed):
+                if not value or index >= last:
+                    continue        # последняя строка может быть недописана — ждём
+                if _OVERLAY_PROVISIONAL.get(keys[index]) != value:
+                    _OVERLAY_PROVISIONAL[keys[index]] = value
+                    changed = True
+        if not changed or on_partial is None:
+            return
+        now = time.time()
+        if now - throttle["at"] < 0.08:      # не чаще ~12 раз в секунду
+            return
+        throttle["at"] = now
+        on_partial()
+
+    try:
+        answer = _chat_completion(
+            _build_blocks_messages(texts), label=f"Оверлей: перевод {len(texts)} блоков",
+            job=job, on_delta=handle if on_partial is not None else None)
+    finally:
+        with lock:
+            for key in keys:
+                _OVERLAY_PROVISIONAL.pop(key, None)
     parsed = parse_numbered_translations(answer, len(texts))
     found = sum(1 for item in parsed if item)
     logger.info("Оверлей: переведено блоков %d из %d.", found, len(texts))
@@ -2691,6 +2730,9 @@ def translate_blocks(texts: list[str], job=None) -> list[str | None]:
 # новыми строками.
 _OVERLAY_CACHE: "OrderedDict[str, str]" = OrderedDict()
 _OVERLAY_CACHE_LIMIT = 800
+# Черновые переводы, которые модель сейчас печатает: показываем, но не запоминаем.
+_OVERLAY_PROVISIONAL: dict[str, str] = {}
+_OVERLAY_PROVISIONAL_LOCK = threading.Lock()
 OVERLAY_CHUNK = 9           # блоков в одной пачке: меньше пачка — раньше первые плашки
 OVERLAY_MAX_WORKERS = 6     # сколько пачек переводить одновременно
 
@@ -2702,6 +2744,16 @@ def overlay_cache_key(text: str) -> str:
 
 def overlay_cache_get(text: str) -> str | None:
     return _OVERLAY_CACHE.get(overlay_cache_key(text))
+
+
+def overlay_display_value(text: str) -> str | None:
+    """Что показать на плашке: готовый перевод или черновой (пока печатается)."""
+    key = overlay_cache_key(text)
+    ready = _OVERLAY_CACHE.get(key)
+    if ready:
+        return ready
+    with _OVERLAY_PROVISIONAL_LOCK:
+        return _OVERLAY_PROVISIONAL.get(key)
 
 
 def overlay_cache_put(text: str, translation: str) -> None:
@@ -2738,7 +2790,8 @@ def overlay_translate(texts: list[str], job=None, *, on_batch=None) -> list[str 
     workers = min(OVERLAY_MAX_WORKERS, len(chunks))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(translate_blocks, [text for _key, text, _indices in chunk], job): chunk
+            pool.submit(translate_blocks, [text for _key, text, _indices in chunk], job,
+                        on_partial=on_batch): chunk
             for chunk in chunks
         }
         for future in as_completed(futures):
@@ -2915,11 +2968,13 @@ class OverlayWindow:
             logger.warning("Оверлей: не удалось настроить окно: %s", exc)
 
     def draw(self, layouts: list[tuple[tuple[int, int, int, int], list[str], int]]) -> None:
-        """Рисует плашки (вызывать в UI-потоке)."""
+        """Рисует плашки и лёгкую подсветку области (вызывать в UI-потоке)."""
         if self.canvas is None:
             return
         try:
             self.canvas.delete("all")
+            if bool(CONFIG.get("overlay_highlight", True)):
+                self._draw_area_frame()
             for (x, y, width, height), lines, size in layouts:
                 pad = max(3, int(size * 0.3))
                 self.canvas.create_rectangle(x, y, x + width, y + height,
@@ -2933,6 +2988,25 @@ class OverlayWindow:
                     text_y += int(size * 1.22)
         except tk.TclError:
             pass
+
+    def _draw_area_frame(self) -> None:
+        """Тонкая рамка и уголки: видно, какую область переводим."""
+        if self.canvas is None:
+            return
+        width = max(20, self.canvas.winfo_width())
+        height = max(20, self.canvas.winfo_height())
+        self.canvas.create_rectangle(1, 1, width - 1, height - 1,
+                                     outline=OVERLAY_AREA_BORDER, width=2, tags=("area",))
+        tick = 26
+        for x0, y0, x1, y1 in ((1, 1, tick, 1), (1, 1, 1, tick),
+                               (width - tick, 1, width - 1, 1),
+                               (width - 1, 1, width - 1, tick),
+                               (1, height - 1, tick, height - 1),
+                               (1, height - tick, 1, height - 1),
+                               (width - tick, height - 1, width - 1, height - 1),
+                               (width - 1, height - tick, width - 1, height - 1)):
+            self.canvas.create_line(x0, y0, x1, y1, fill=OVERLAY_AREA_TICK, width=3,
+                                    tags=("area",))
 
     def clear(self) -> None:
         if self.canvas is not None:
@@ -2970,14 +3044,27 @@ class _OverlayCancel:
 
 
 class OverlayController:
-    """Включение/выключение перевода поверх экрана и цикл обновления."""
+    """Включение/выключение перевода поверх экрана.
+
+    Работают два потока: съёмщик («снял кадр → распознал → нарисовал, что уже
+    знаю») и переводчик (переводит только новые строки и после каждой пачки
+    просит перерисовать). Поэтому сеть никогда не задерживает съёмку: кадры
+    идут своим темпом, а плашки подтягиваются к текущему кадру за один запрос.
+    """
 
     def __init__(self) -> None:
         self._enabled = False
         self._stop = threading.Event()
         self._thread: "threading.Thread | None" = None
+        self._translator: "threading.Thread | None" = None
         self._window: "OverlayWindow | None" = None
         self._lock = threading.Lock()
+        # Что видно на экране сейчас: с этим списком рисуются плашки.
+        self._blocks: list[TextBlock] = []
+        self._blocks_lock = threading.Lock()
+        self._dirty = threading.Event()
+        # Когда строка впервые появилась: допечатывающийся текст не переводим.
+        self._first_seen: dict[str, float] = {}
         self._last_digest = ""
         # Кэш распознавания по тайлам: неизменные части экрана не OCR-ятся заново.
         self._tile_cache: dict[tuple[int, int, int, int],
@@ -2997,6 +3084,15 @@ class OverlayController:
             except (TypeError, ValueError):
                 pass
         return _virtual_screen_bounds()
+
+    def area_label(self) -> str:
+        saved = CONFIG.get("overlay_area")
+        if isinstance(saved, (list, tuple)) and len(saved) == 4:
+            try:
+                return f"область {int(saved[2])}×{int(saved[3])}"
+            except (TypeError, ValueError):
+                pass
+        return "весь экран"
 
     # --- управление -------------------------------------------------------
     def toggle(self) -> bool:
@@ -3018,17 +3114,25 @@ class OverlayController:
         with self._lock:
             self._enabled = True
             self._stop.clear()
+            self._dirty.clear()
             self._last_digest = ""
             self._tile_cache.clear()
+            self._first_seen.clear()
+            with self._blocks_lock:
+                self._blocks = []
             self._window = OverlayWindow(area)
             window = self._window
         run_on_ui(window.build)
+        self._translator = threading.Thread(target=self._translate_loop,
+                                            name="overlay-translate", daemon=True)
+        self._translator.start()
         self._thread = threading.Thread(target=self._loop, args=(window,),
                                         name="overlay", daemon=True)
         self._thread.start()
-        logger.info("Оверлей включён: область %s, обновление каждые %.1f с.",
-                    area, float(CONFIG.get("overlay_interval") or 1.0))
-        _toast("Перевод поверх экрана: ВКЛ", kind="success")
+        interval = float(CONFIG.get("overlay_interval") or 0.5)
+        logger.info("Оверлей включён: область %s (%s), обновление каждые %.1f с.",
+                    area, self.area_label(), interval)
+        _toast(f"Перевод поверх экрана: ВКЛ · {self.area_label()}", kind="success")
         return True
 
     def stop(self, reason: str = "") -> None:
@@ -3037,6 +3141,7 @@ class OverlayController:
                 return
             self._enabled = False
             self._stop.set()
+            self._dirty.set()
             window = self._window
             self._window = None
         if window is not None:
@@ -3053,7 +3158,7 @@ class OverlayController:
         self.stop("смена области")
         self.start()
 
-    # --- цикл -------------------------------------------------------------
+    # --- распознавание ----------------------------------------------------
     def _recognize(self, shot: Image.Image) -> tuple[list[TextBlock], int]:
         """Распознаёт кадр по тайлам, неизменные тайлы берёт из кэша.
 
@@ -3086,9 +3191,10 @@ class OverlayController:
         combined = [block for part in parts for block in part]
         return _filter_blocks(_merge_paragraphs(_dedupe_blocks(combined))), len(stale)
 
+    # --- потоки -----------------------------------------------------------
     def _loop(self, window: OverlayWindow) -> None:
-        cancel = _OverlayCancel(self._stop)
-        interval = max(0.5, float(CONFIG.get("overlay_interval") or 1.0))
+        """Съёмщик: снимает кадр, распознаёт изменения и сразу рисует что знает."""
+        interval = max(0.25, float(CONFIG.get("overlay_interval") or 0.4))
         last_signature = ""
         while not self._stop.is_set():
             started = time.time()
@@ -3101,48 +3207,83 @@ class OverlayController:
                     continue
                 shot = shot.convert("RGB")
                 signature = screen_signature(shot)
-                if signature == last_signature:
-                    self._stop.wait(interval)
-                    continue
-                last_signature = signature
-                ocr_started = time.time()
-                blocks, changed_tiles = self._recognize(shot)
-                ocr_ms = (time.time() - ocr_started) * 1000
-                pending = [block for block in blocks if should_translate_block(block.text)]
-                # Крупные надписи — первыми: они заметнее, плашки появятся раньше.
-                pending.sort(key=lambda block: -block.rect[2] * block.rect[3])
-                if not pending:
-                    run_on_ui(window.clear)
-                    self._last_digest = ""
-                    self._stop.wait(interval)
-                    continue
-                # 1. Сразу показываем то, что уже есть в кэше — без ожидания сети.
-                self._redraw(window, pending)
-                texts = [block.text for block in pending]
-                cached = sum(1 for text in texts if overlay_cache_get(text))
-                logger.info("Оверлей: OCR %.0f мс (%d тайлов), блоков %d, из кэша %d.",
-                            ocr_ms, changed_tiles, len(pending), cached)
-                # 2. Догружаем новые строки пачками; после каждой пачки — перерисовка.
-                translate_started = time.time()
-                translations = overlay_translate(
-                    texts, job=cancel, on_batch=lambda: self._redraw(window, pending))
-                self._redraw(window, pending)
-                logger.info("Оверлей: переведено %d из %d за %.1f с.",
-                            sum(1 for value in translations if value), len(texts),
-                            time.time() - translate_started)
+                if signature != last_signature:
+                    last_signature = signature
+                    ocr_started = time.time()
+                    blocks, changed_tiles = self._recognize(shot)
+                    pending = [block for block in blocks if should_translate_block(block.text)]
+                    # Крупные надписи — первыми: они заметнее, плашки появятся раньше.
+                    pending.sort(key=lambda block: -block.rect[2] * block.rect[3])
+                    with self._blocks_lock:
+                        self._blocks = pending
+                    now = time.time()
+                    seen = {block.text for block in pending}
+                    for text in list(self._first_seen):
+                        if text not in seen:
+                            self._first_seen.pop(text, None)
+                    for text in seen:
+                        self._first_seen.setdefault(text, now)
+                    self._redraw()
+                    cached = sum(1 for block in pending if overlay_cache_get(block.text))
+                    logger.info("Оверлей: OCR %.0f мс (%d тайлов), блоков %d, из кэша %d.",
+                                (time.time() - ocr_started) * 1000, changed_tiles,
+                                len(pending), cached)
+                    self._dirty.set()
             except Cancelled:
                 break
             except Exception as exc:  # noqa: BLE001
                 if self._stop.is_set():
                     break
-                logger.warning("Оверлей: ошибка обновления: %s", exc)
-            elapsed = time.time() - started
-            self._stop.wait(max(min(interval, 0.5) - elapsed, 0.25))
-        logger.info("Оверлей: цикл завершён.")
+                logger.warning("Оверлей: ошибка съёмки: %s", exc)
+            self._stop.wait(max(interval - (time.time() - started), 0.15))
+        logger.info("Оверлей: поток съёмки завершён.")
 
-    def _redraw(self, window: "OverlayWindow", blocks: list[TextBlock]) -> None:
-        """Рисует плашки по тому, что уже известно (кэш + готовые пачки)."""
-        values = [overlay_cache_get(block.text) for block in blocks]
+    def _translate_loop(self) -> None:
+        """Переводчик: переводит только новые устойчивые строки, пачками."""
+        cancel = _OverlayCancel(self._stop)
+        stable = max(0.0, float(CONFIG.get("overlay_stable") or 0.15))
+        while not self._stop.is_set():
+            with self._blocks_lock:
+                blocks = list(self._blocks)
+            now = time.time()
+            ready: list[str] = []
+            seen: set[str] = set()
+            for block in blocks:
+                text = block.text
+                if text in seen:
+                    continue
+                seen.add(text)
+                if overlay_cache_get(text) is not None:
+                    continue
+                if stable and now - self._first_seen.get(text, now) < stable:
+                    continue        # текст ещё печатается — подождём кадр-другой
+                ready.append(text)
+            if not ready:
+                self._stop.wait(0.2)
+                continue
+            started = time.time()
+            try:
+                translations = overlay_translate(ready, job=cancel, on_batch=self._redraw)
+                logger.info("Оверлей: переведено %d из %d новых за %.1f с.",
+                            sum(1 for value in translations if value), len(ready),
+                            time.time() - started)
+            except Cancelled:
+                break
+            except Exception as exc:  # noqa: BLE001
+                if self._stop.is_set():
+                    break
+                logger.warning("Оверлей: ошибка перевода: %s", exc)
+                self._stop.wait(0.3)
+        logger.info("Оверлей: поток перевода завершён.")
+
+    def _redraw(self) -> None:
+        """Рисует плашки по текущему кадру и тому, что уже переведено."""
+        window = self._window
+        if window is None:
+            return
+        with self._blocks_lock:
+            blocks = list(self._blocks)
+        values = [overlay_display_value(block.text) for block in blocks]
         layouts = build_overlay_layouts(blocks, values, (window.area[2], window.area[3]))
         run_on_ui(lambda layouts=layouts: window.draw(layouts))
 

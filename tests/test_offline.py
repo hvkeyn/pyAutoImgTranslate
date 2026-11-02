@@ -1,4 +1,4 @@
-"""Офлайн-проверки логики pyAutoImgTranslate: без сети, без GUI, без хоткеев.
+﻿"""Офлайн-проверки логики pyAutoImgTranslate: без сети, без GUI, без хоткеев.
 
 Запуск:
     .venv\\Scripts\\python.exe tests\\test_offline.py         (Windows)
@@ -423,7 +423,7 @@ def test_overlay_signature_and_cache() -> None:
     calls = {"count": 0}
     original = app.translate_blocks
 
-    def fake(texts, job=None):
+    def fake(texts, job=None, on_partial=None):
         calls["count"] += 1
         return [f"перевод: {text}" for text in texts]
 
